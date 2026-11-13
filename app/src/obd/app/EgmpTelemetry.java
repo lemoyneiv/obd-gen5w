@@ -418,21 +418,27 @@ public final class EgmpTelemetry {
             return true;
         }
 
-        // 3. BMS 7EC -> 22 0106 (Coolant Temp, Pack Inlet Temp, Thermal Management Mode, Charging Flag)
+        // 3. BMS 7EC -> 22 0106 (Cooling Water Temp uds[7], Optional Coolant2/Status uds[9], Thermal Mode, Charging Flag)
         if (did == 0x0106 && uds.length >= 28 && (canId == CAN_BMS_RX || canId == -1)) {
             live.hasBms0106 = true;
             int rawCoolant = (int) uds[7];
-            if (rawCoolant >= -40 && rawCoolant <= 120) {
+            boolean validCoolant = (rawCoolant >= -40 && rawCoolant <= 120);
+            if (validCoolant) {
                 live.coolantTempC = rawCoolant;
             }
             if (uds.length >= 10) {
                 int rawInlet = (int) uds[9];
-                if (rawInlet == 0 && live.battTempMinC >= 12 && rawCoolant >= 12) {
-                    live.battInletTempC = rawCoolant;
-                } else if (rawInlet >= -40 && rawInlet <= 120) {
+                // On US E-GMP BMS firmware, uds[9] is a 0/1 coolant-pump/status byte rather than a
+                // second thermistor, whereas uds[7] is the verified HV battery cooling water temp.
+                boolean looksLikeStatusFlag = (rawInlet == 0 || rawInlet == 1)
+                        && ((validCoolant && rawCoolant >= 4) || live.battTempMinC >= 4);
+                if (!looksLikeStatusFlag && rawInlet >= -40 && rawInlet <= 120
+                        && (!validCoolant || Math.abs(rawInlet - rawCoolant) <= 10)) {
                     live.battInletTempC = rawInlet;
+                } else if (validCoolant) {
+                    live.battInletTempC = rawCoolant;
                 }
-            } else if (live.battInletTempC == Integer.MIN_VALUE && rawCoolant >= -40 && rawCoolant <= 120) {
+            } else if (live.battInletTempC == Integer.MIN_VALUE && validCoolant) {
                 live.battInletTempC = rawCoolant;
             }
             live.thermalModeRaw = uds[12] & 0xFF;
@@ -625,6 +631,9 @@ public final class EgmpTelemetry {
     }
 
     private void maybeRecordCsvRowLocked(long nowMs) {
+        if (!live.hasBms0101 && (live.hasBms0105 || live.hasBms0106 || live.hasAbs || live.hasIccu)) {
+            return;
+        }
         if (nowMs - lastCsvSampleMs < 1000L) {
             return;
         }

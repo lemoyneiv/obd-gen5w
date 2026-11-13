@@ -49,6 +49,8 @@ public final class Gen5wBleClient {
         void onCharacteristicRead(String mac, String uuid, byte[] value, String error);
         void onCharacteristicChanged(String mac, String uuid, byte[] value);
         void onCharacteristicWrite(String mac, String uuid, String error);
+        void onConnectionParamsUpdated(String mac, String summary);
+        void onBridgeStatus(String status);
         void onSessionClosed(String reason);
     }
 
@@ -66,6 +68,8 @@ public final class Gen5wBleClient {
         @Override public void onCharacteristicRead(String mac, String uuid, byte[] value, String error) {}
         @Override public void onCharacteristicChanged(String mac, String uuid, byte[] value) {}
         @Override public void onCharacteristicWrite(String mac, String uuid, String error) {}
+        @Override public void onConnectionParamsUpdated(String mac, String summary) {}
+        @Override public void onBridgeStatus(String status) {}
         @Override public void onSessionClosed(String reason) {}
     }
 
@@ -175,6 +179,10 @@ public final class Gen5wBleClient {
         sendTargeted(mac, verb + Gen5wBleAdvRecord.normalizeUuid(uuid) + " " + hex);
     }
 
+    public void requestBridgeStatus() {
+        sendRaw("STATUS");
+    }
+
     public void close() {
         if (!closed.compareAndSet(false, true)) return;
         open.set(false);
@@ -208,6 +216,10 @@ public final class Gen5wBleClient {
             if (listener != null) listener.onSessionReady(ver);
             return;
         }
+        if (line.startsWith("BRIDGE_STATUS ")) {
+            if (listener != null) listener.onBridgeStatus(line.substring("BRIDGE_STATUS ".length()).trim());
+            return;
+        }
 
         String mac = "";
         if (line.startsWith("@")) {
@@ -234,6 +246,12 @@ public final class Gen5wBleClient {
             byte[] ad = hexToBytes(p[4]);
             if (listener != null) {
                 listener.onAdvertisement(p[1], addrType, rssi, Gen5wBleAdvRecord.parse(ad));
+            }
+            return;
+        }
+        if ("CONN_PARAM".equals(head) && p.length >= 2) {
+            if (listener != null) {
+                listener.onConnectionParamsUpdated(mac, line.substring("CONN_PARAM".length()).trim());
             }
             return;
         }

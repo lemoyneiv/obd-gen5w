@@ -376,8 +376,32 @@ public final class Elm327Protocol {
         if ((pw & (PROP_WRITE | PROP_WRITE_NO_RESP)) == 0) return;
         String key = notifyNorm + "->" + writeNorm;
         if (!seenPairs.add(key)) return;
-        boolean wnr = (pw & PROP_WRITE) == 0 && (pw & PROP_WRITE_NO_RESP) != 0;
+        // Prefer Write Without Response (ATT 0x52) when supported (e.g. Veepeak fff2:0c)
+        // to halve BLE link-layer turnarounds and prevent ATT_Write_Rsp head-of-line stalls;
+        // BleCoordinator.probeCandidateBinding automatically falls back to ATT_Write_Req (0x12)
+        // if the adapter also advertises PROP_WRITE (0x08).
+        boolean wnr = (pw & PROP_WRITE_NO_RESP) != 0;
         out.add(new GattBinding(profileName, expandFullUuid(notifyNorm), expandFullUuid(writeNorm), wnr, pw));
+    }
+
+    /**
+     * Strips echoed AT command prefixes (such as {@code "ATI"} or {@code "ATZ"} before {@code ATE0}
+     * runs) and normalizes whitespace in an ELM327 identification banner.
+     */
+    public static String cleanAdapterVersion(String raw) {
+        if (raw == null) return "";
+        String s = raw.replace('\r', ' ').replace('\n', ' ').trim();
+        while (s.regionMatches(true, 0, "ATI ", 0, 4) || s.regionMatches(true, 0, "ATZ ", 0, 4)) {
+            s = s.substring(4).trim();
+        }
+        if ("ATI".equalsIgnoreCase(s) || "ATZ".equalsIgnoreCase(s)) {
+            return "";
+        }
+        s = s.replaceAll("\\s{2,}", " ").trim();
+        if (s.length() > 28) {
+            s = s.substring(0, 28).trim();
+        }
+        return s;
     }
 
     /**

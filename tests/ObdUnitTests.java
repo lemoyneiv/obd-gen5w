@@ -87,8 +87,12 @@ public final class ObdUnitTests {
         check(vp != null, "Veepeak FFF0 GATT with READ-only OTA fff4:02 must resolve");
         check(Elm327Protocol.UUID_FFF1_NOTIFY.equals(vp.notifyUuid), "Veepeak notify UUID must be FFF1");
         check(Elm327Protocol.UUID_FFF2_WRITE.equals(vp.writeUuid), "Veepeak write UUID must be FFF2");
-        check(!vp.writeWithoutResponse, "Prefer WRITE with response when 0x08 is advertised");
+        check(vp.writeWithoutResponse, "Prefer Write Without Response (0x04) when 0x0C is advertised");
         check(vp.supportsAlternateWriteMode(), "0x0C write mask must advertise alternate write mode");
+        check("ELM327 v1.5".equals(Elm327Protocol.cleanAdapterVersion("ATI\rELM327 v1.5\r")),
+                "cleanAdapterVersion must strip echoed ATI prefix");
+        check("ELM327 v2.2".equals(Elm327Protocol.cleanAdapterVersion("ATZ \n ATI  ELM327 v2.2")),
+                "cleanAdapterVersion must strip chained ATZ/ATI echo prefixes");
 
         // 1b. Dual-mode BLE+SPP 0x18F0 profile (0x2AF0 Notify + 0x2AF1 Write)
         Map<String, Integer> dual18f0 = new LinkedHashMap<String, Integer>();
@@ -433,6 +437,21 @@ public final class ObdUnitTests {
                 "formatDistance miles must use exact miles without double conversion");
         check("29,692 km".equals(EgmpTelemetry.formatDistance(usSnap.odometerKm, usSnap.odometerMiles, false)),
                 "formatDistance km from US miles");
+        check(usCar.csvRowCount() == 0,
+                "E-GMP CSV recorder must skip partial Cycle-0 rows before primary 220101 arrives");
+
+        // 8b. Verify US Ioniq 5 220106 where uds[7]=9C (coolant water) and uds[9]=1 (pump/status flag)
+        byte[] us0106Drive = new byte[29];
+        us0106Drive[0] = 0x62; us0106Drive[1] = 0x01; us0106Drive[2] = 0x06;
+        us0106Drive[7] = 9;   // Verified coolingWaterTempC = 9 C
+        us0106Drive[9] = 1;   // US BMS status byte = 1 while driving (NOT 1 C!)
+        check(usCar.applyMessages(Collections.singletonList(new Elm327Protocol.IsoTpMessage(0x7EC, us0106Drive))),
+                "US Ioniq 5 220106 frame must apply");
+        EgmpTelemetry.Snapshot us0106Snap = usCar.snapshot();
+        check(us0106Snap.coolantTempC == 9, "US 220106 coolantTempC must be 9 C");
+        check(us0106Snap.battInletTempC == 9,
+                "US 220106 battInletTempC must use coolingWaterTempC (9 C) instead of uds[9]=1 flag, got "
+                        + us0106Snap.battInletTempC);
 
         // 9. Verify HMG-API vehicle signal fallback when CAN speed/gear/odo have not arrived yet
         EgmpTelemetry hmgFallback = new EgmpTelemetry();
@@ -491,14 +510,43 @@ public final class ObdUnitTests {
         check(parsed.text.contains("BTPID: 1842")
                 && parsed.text.contains("=== END BTPROBE ROOT READ-ONLY SNAPSHOT ==="),
                 "LFD1 stdout chunks must concatenate cleanly");
+
+        String noisyProbe = "=== BEGIN BTPROBE ROOT READ-ONLY SNAPSHOT (ts=1) ===\n"
+                + "BTPID: 1811 (com.android.bluetooth)\n"
+                + "BTMAP: r-xp /system/lib/libc.so\n"
+                + "BTMAP: rw-p /dev/ashmem/dalvik-heap\n"
+                + "BTMAP: r-xp /system/lib/hw/bplus.default.so\n"
+                + "BTFD: 32 -> /dev/ttyHS0\n"
+                + "HMGLOG: BtHookEntry v0.1.3 active\n"
+                + "=== END BTPROBE ROOT READ-ONLY SNAPSHOT ===\n";
+        List<String> filteredProbe = HmgapidClient.filterBtProbeLines(noisyProbe, 20);
+        check(filteredProbe.contains("BTMAP: r-xp /system/lib/hw/bplus.default.so"),
+                "filterBtProbeLines must keep bplus.default.so");
+        check(!filteredProbe.contains("BTMAP: r-xp /system/lib/libc.so")
+                && !filteredProbe.contains("BTMAP: rw-p /dev/ashmem/dalvik-heap"),
+                "filterBtProbeLines must drop generic libc/ashmem BTMAP lines");
+        check("=== END BTPROBE ROOT READ-ONLY SNAPSHOT ===".equals(filteredProbe.get(filteredProbe.size() - 1)),
+                "filterBtProbeLines must preserve END BTPROBE marker");
     }
 
     private static void testMultiConnAclCreditReclaimAndDisconnectIsolation() throws Exception {
+        // Pure unit tests for L2CAP 0x12 Connection Parameter Update Request policy
+        check(BleGattSessionManager.shouldAcceptConnParamUpdate(24, 40, 0, 400),
+                "Fast 30..50ms lat=0 timeout=4.0s conn param update must be accepted");
+        check(!BleGattSessionManager.shouldAcceptConnParamUpdate(160, 320, 0, 400),
+                "Slow 200..400ms power-saving QN902x conn param update must be REJECTED");
+        check(!BleGattSessionManager.shouldAcceptConnParamUpdate(24, 40, 4, 400),
+                "High slave latency (lat=4) conn param update must be REJECTED");
+        check(!BleGattSessionManager.shouldAcceptConnParamUpdate(24, 40, 0, 50),
+                "Short supervision timeout (<1.0s) conn param update must be REJECTED");
+
         final ExecutorService hciRxExec = Executors.newSingleThreadExecutor();
         final BleGattSessionManager[] mgrRef = new BleGattSessionManager[1];
         final AtomicBoolean dropCompletedPkts = new AtomicBoolean(false);
-        final AtomicInteger slowReadMs = new AtomicInteger(0);
+        final AtomicInteger slowVpReadMs = new AtomicInteger(0);
         final AtomicInteger nextHandle = new AtomicInteger(0x0040);
+        final AtomicInteger connUpdateHciCount = new AtomicInteger(0);
+        final List<byte[]> l2capSigTx = Collections.synchronizedList(new ArrayList<byte[]>());
 
         BtNativeBridge.Transport mockTransport = new BtNativeBridge.Transport() {
             @Override
@@ -514,11 +562,23 @@ public final class ObdUnitTests {
                         } else if (opcode == BleGattSessionManager.HCI_LE_CREATE_CONNECTION) {
                             m.onHciEvent(new byte[] { 0x0F, 0x04, 0x00, 0x01, 0x0D, 0x20 });
                             int h = nextHandle.getAndIncrement();
-                            byte[] cc = new byte[19];
-                            cc[0] = 0x3E; cc[1] = 17; cc[2] = 0x01; cc[3] = 0x00;
+                            byte[] cc = new byte[22];
+                            cc[0] = 0x3E; cc[1] = 19; cc[2] = 0x01; cc[3] = 0x00;
                             cc[4] = (byte) (h & 0xFF); cc[5] = (byte) ((h >> 8) & 0xFF);
                             System.arraycopy(cmd, 9, cc, 8, 6);
+                            cc[14] = 24; cc[15] = 0; // initial interval = 24 (30ms)
+                            cc[16] = 0;  cc[17] = 0; // latency = 0
+                            cc[18] = (byte) 0x90; cc[19] = 0x01; // timeout = 400 (4.0s)
                             m.onHciEvent(cc);
+                        } else if (opcode == BleGattSessionManager.HCI_LE_CONNECTION_UPDATE) {
+                            connUpdateHciCount.incrementAndGet();
+                            int h = (cmd[3] & 0xFF) | ((cmd[4] & 0x0F) << 8);
+                            m.onHciEvent(new byte[] { 0x0F, 0x04, 0x00, 0x01, 0x13, 0x20 });
+                            m.onHciEvent(new byte[] {
+                                    0x3E, 0x0A, 0x03, 0x00,
+                                    (byte) (h & 0xFF), (byte) ((h >> 8) & 0xFF),
+                                    cmd[5], cmd[6], cmd[9], cmd[10], cmd[11], cmd[12]
+                            });
                         } else if (opcode == BleGattSessionManager.HCI_DISCONNECT) {
                             int h = (cmd[3] & 0xFF) | ((cmd[4] & 0xFF) << 8);
                             m.onHciEvent(new byte[] { 0x0F, 0x04, 0x00, 0x01, 0x06, 0x04 });
@@ -537,8 +597,14 @@ public final class ObdUnitTests {
             @Override
             public boolean sendLeAcl(final byte[] acl) {
                 final int h = ((acl[0] & 0xFF) | ((acl[1] & 0xFF) << 8)) & 0x0FFF;
-                final int attOp = (acl.length > 8) ? (acl[8] & 0xFF) : -1;
+                final int cid = (acl.length >= 8) ? ((acl[6] & 0xFF) | ((acl[7] & 0xFF) << 8)) : -1;
+                final int attOp = (cid == 0x0004 && acl.length > 8) ? (acl[8] & 0xFF) : -1;
                 final int startH = (acl.length >= 11) ? ((acl[9] & 0xFF) | ((acl[10] & 0xFF) << 8)) : 0;
+                if (cid == BleGattSessionManager.L2CAP_CID_LE_SIGNALING && acl.length >= 14) {
+                    byte[] sig = new byte[acl.length - 8];
+                    System.arraycopy(acl, 8, sig, 0, sig.length);
+                    l2capSigTx.add(sig);
+                }
                 hciRxExec.execute(new Runnable() {
                     @Override
                     public void run() {
@@ -549,6 +615,7 @@ public final class ObdUnitTests {
                                     (byte) (h & 0xFF), (byte) ((h >> 8) & 0xFF), 0x01, 0x00
                             });
                         }
+                        if (attOp < 0) return;
                         byte[] attRsp = null;
                         if (attOp == BleGattSessionManager.ATT_READ_BY_GROUP_TYPE_REQ) {
                             if (startH <= 0x0010) {
@@ -585,9 +652,19 @@ public final class ObdUnitTests {
                         } else if (attOp == BleGattSessionManager.ATT_WRITE_REQ) {
                             attRsp = new byte[] { 0x13 };
                         } else if (attOp == BleGattSessionManager.ATT_READ_REQ) {
-                            int delay = slowReadMs.get();
+                            final int delay = (h == 0x0040) ? slowVpReadMs.get() : 0;
                             if (delay > 0) {
-                                try { Thread.sleep(delay); } catch (InterruptedException ignored) {}
+                                Thread delayedReply = new Thread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        try { Thread.sleep(delay); } catch (InterruptedException ignored) {}
+                                        byte[] okRsp = new byte[] { 0x0B, 0x4F, 0x4B };
+                                        m.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(h, 0x0004, okRsp));
+                                    }
+                                });
+                                delayedReply.setDaemon(true);
+                                delayedReply.start();
+                                return;
                             }
                             attRsp = new byte[] { 0x0B, 0x4F, 0x4B }; // "OK" -> 4f4b
                         }
@@ -651,16 +728,54 @@ public final class ObdUnitTests {
             String vpMac = "66:1E:87:00:B2:9F";
             String bvmMac = "A4:C1:38:A2:71:BA";
 
-            clientWrite.write(("MULTICONN 1\nCONNECT " + vpMac + " 0 *\nCONNECT " + bvmMac + " 0 *\n").getBytes(UTF8));
+            clientWrite.write(("MULTICONN 1\nCONNECT " + vpMac + " 0 *\nCONNECT " + bvmMac + " 0 *\nSTATUS\n").getBytes(UTF8));
             clientWrite.flush();
 
             waitForLine(serverLines, "@" + vpMac + " GATT_READY " + vpMac, 4000L);
             waitForLine(serverLines, "@" + bvmMac + " GATT_READY " + bvmMac, 4000L);
-            check(mgr.describeActiveSessions().contains("credits=4/4"),
-                    "Shared Broadcom pool (leNumPkts=0) must initialize to 4/4 ACL credits, got: "
+            waitForLine(serverLines, "BRIDGE_STATUS sessions=1 connections=2/4", 3000L);
+            check(mgr.describeActiveSessions().contains("credits=4/4")
+                    && mgr.describeActiveSessions().contains("int=24"),
+                    "Shared Broadcom pool (leNumPkts=0) must initialize to 4/4 ACL credits + int=24, got: "
                             + mgr.describeActiveSessions());
 
-            // Test 1: Drop 0x13 Number_Of_Completed_Packets and issue 5 WRITE_CHAR_NR on Veepeak
+            // Test 1: Simulate QN902x 20-second L2CAP 0x12 slow Connection Parameter Update Request
+            // (minInt=160 [200ms], maxInt=320 [400ms], lat=0, timeout=400) on Veepeak handle 0x0040:
+            // MUST reject with 0x0001 on CID 0x0005 and MUST NOT issue HCI_LE_CONNECTION_UPDATE!
+            serverLines.clear();
+            l2capSigTx.clear();
+            connUpdateHciCount.set(0);
+            byte[] slowConnReq = new byte[] {
+                    0x12, 0x07, 0x08, 0x00,
+                    (byte) 0xA0, 0x00, // minInt = 160 (200ms)
+                    0x40, 0x01,        // maxInt = 320 (400ms)
+                    0x00, 0x00,        // lat = 0
+                    (byte) 0x90, 0x01  // timeout = 400 (4.0s)
+            };
+            mgr.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(0x0040, BleGattSessionManager.L2CAP_CID_LE_SIGNALING, slowConnReq));
+            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM REJECTED min=160 max=320 lat=0 timeout=400", 2000L);
+            check(connUpdateHciCount.get() == 0,
+                    "Slow L2CAP 0x12 request MUST NOT trigger HCI_LE_CONNECTION_UPDATE");
+            check(!l2capSigTx.isEmpty() && (l2capSigTx.get(0)[0] & 0xFF) == 0x13 && l2capSigTx.get(0)[4] == 0x01,
+                    "Slow L2CAP 0x12 request must send L2CAP 0x13 Rejected (0x0001)");
+
+            // Test 1b: Fast L2CAP 0x12 request (minInt=16 [20ms], maxInt=32 [40ms], lat=0, timeout=400)
+            // MUST be accepted (0x0000) and update connIntervalUnits cleanly!
+            serverLines.clear();
+            l2capSigTx.clear();
+            byte[] fastConnReq = new byte[] {
+                    0x12, 0x08, 0x08, 0x00,
+                    0x10, 0x00,        // minInt = 16 (20ms)
+                    0x20, 0x00,        // maxInt = 32 (40ms)
+                    0x00, 0x00,        // lat = 0
+                    (byte) 0x90, 0x01  // timeout = 400 (4.0s)
+            };
+            mgr.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(0x0040, BleGattSessionManager.L2CAP_CID_LE_SIGNALING, fastConnReq));
+            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM ACCEPTED min=16 max=32 lat=0 timeout=400", 2000L);
+            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM UPDATED interval=16 lat=0 timeout=400", 2000L);
+            check(connUpdateHciCount.get() == 1, "Fast L2CAP 0x12 request must issue HCI_LE_CONNECTION_UPDATE");
+
+            // Test 2: Drop 0x13 Number_Of_Completed_Packets and issue 5 WRITE_CHAR_NR on Veepeak
             // (exceeding 4 credits) — must reclaim stale credits and NEVER fail with ACL_TX_FAILED!
             dropCompletedPkts.set(true);
             serverLines.clear();
@@ -678,10 +793,24 @@ public final class ObdUnitTests {
                     "All 5 WRITE_CHAR_NR commands must succeed via stale ACL credit reclaim when 0x13 is dropped, got: "
                             + serverLines);
 
-            // Test 2: Start a slow READ_CHAR on Veepeak (220ms) and immediately issue @<BVM_MAC> DISCONNECT!
-            // Disconnecting BVM02 MUST NOT abort Veepeak's in-flight ATT transaction!
+            // Test 3: Per-connection GATT worker isolation!
+            // Stall Veepeak READ_CHAR for 500ms while simultaneously issuing READ_CHAR on BVM02 —
+            // BVM02 MUST complete immediately without head-of-line blocking behind Veepeak!
             dropCompletedPkts.set(false);
-            slowReadMs.set(220);
+            slowVpReadMs.set(500);
+            serverLines.clear();
+            long tStart = System.currentTimeMillis();
+            clientWrite.write(("@" + vpMac + " READ_CHAR fff1\n@" + bvmMac + " READ_CHAR fff1\n").getBytes(UTF8));
+            clientWrite.flush();
+            waitForLine(serverLines, "@" + bvmMac + " OP_OK READ_CHAR fff1 4f4b", 350L);
+            long bvmElapsed = System.currentTimeMillis() - tStart;
+            check(bvmElapsed < 400L,
+                    "BVM02 GATT op must not block behind slow Veepeak ATT op (elapsed=" + bvmElapsed + "ms)");
+            waitForLine(serverLines, "@" + vpMac + " OP_OK READ_CHAR fff1 4f4b", 2000L);
+
+            // Test 4: Start a slow READ_CHAR on Veepeak (250ms) and immediately issue @<BVM_MAC> DISCONNECT!
+            // Disconnecting BVM02 MUST NOT abort Veepeak's in-flight ATT transaction!
+            slowVpReadMs.set(250);
             serverLines.clear();
             clientWrite.write(("@" + vpMac + " READ_CHAR fff1\n").getBytes(UTF8));
             clientWrite.flush();
@@ -796,12 +925,12 @@ public final class ObdUnitTests {
                 out.flush();
 
                 waitUntil = System.currentTimeMillis() + 1500L;
-                String expectedTx = "@" + obdMac + " WRITE_CHAR fff2 415452560d";
+                String expectedTx = "@" + obdMac + " WRITE_CHAR_NR fff2 415452560d";
                 while (!sentBridgeLines.contains(expectedTx) && System.currentTimeMillis() < waitUntil) {
                     Thread.sleep(20L);
                 }
                 check(sentBridgeLines.contains(expectedTx),
-                        "TCP client command ATRV\\r must relay to Veepeak FFF2 write characteristic");
+                        "TCP client command ATRV\\r must relay to Veepeak FFF2 write-without-response characteristic");
 
                 coord.getBleClient().handleServerLine(
                         "@" + obdMac + " CHAR_NOTIFY fff1 31342E34560D3E");

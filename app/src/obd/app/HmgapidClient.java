@@ -8,8 +8,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -301,6 +304,61 @@ public final class HmgapidClient {
         if (fullLog == null || beginMarker == null || beginMarker.isEmpty()) return fullLog;
         int lastBegin = fullLog.lastIndexOf(beginMarker);
         return (lastBegin >= 0) ? fullLog.substring(lastBegin) : fullLog;
+    }
+
+    /**
+     * Filters raw {@code btprobe} output so generic Android system/ashmem {@code BTMAP:} entries
+     * do not crowd out Bluetooth HAL libraries ({@code bplus.default.so}), open FDs ({@code BTFD:}),
+     * properties, {@code HMGLOG:}, and the snapshot end marker.
+     */
+    public static List<String> filterBtProbeLines(String rawText, int maxLines) {
+        List<String> out = new ArrayList<String>();
+        if (rawText == null || rawText.isEmpty() || maxLines <= 0) {
+            return out;
+        }
+        String[] lines = rawText.split("[\\r\\n]+");
+        String endLine = null;
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i].trim();
+            if (line.isEmpty()) continue;
+            if (line.startsWith("=== END BTPROBE")) {
+                endLine = line;
+            }
+            if (line.startsWith("BTMAP:")) {
+                String low = line.substring(6).toLowerCase(Locale.US);
+                if (low.contains("/dev/ashmem/") || low.contains("/dev/__properties__")) {
+                    continue;
+                }
+                boolean relevant = low.contains("bt")
+                        || low.contains("blue")
+                        || low.contains("bplus")
+                        || low.contains("bcm")
+                        || low.contains("brcm")
+                        || low.contains("serial")
+                        || low.contains("tty")
+                        || low.contains("uart")
+                        || low.contains("rfkill")
+                        || low.contains("obd")
+                        || low.contains("bvm")
+                        || low.contains("hmg")
+                        || low.contains("xposed")
+                        || low.contains("app-lib");
+                if (!relevant) {
+                    continue;
+                }
+            }
+            if (out.size() < maxLines) {
+                out.add(line);
+            }
+        }
+        if (endLine != null && !out.isEmpty() && !endLine.equals(out.get(out.size() - 1))) {
+            if (out.size() >= maxLines) {
+                out.set(out.size() - 1, endLine);
+            } else {
+                out.add(endLine);
+            }
+        }
+        return out;
     }
 
     private static void writeU32Le(ByteArrayOutputStream o, int v) {

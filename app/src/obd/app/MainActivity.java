@@ -911,13 +911,12 @@ public final class MainActivity extends Activity implements BleCoordinator.UiLis
             @Override
             public void run() {
                 try {
+                    coordinator.getBleClient().requestBridgeStatus();
                     HmgapidClient.Reply r = HmgapidClient.runBtProbe(6500);
                     DiagLogger.get().info("BTPROBE", "Exit=" + r.code + " (" + r.text.length() + " chars)");
-                    String[] lines = r.text.split("[\\r\\n]+");
-                    for (int i = 0; i < lines.length && i < 80; i++) {
-                        if (!lines[i].trim().isEmpty()) {
-                            DiagLogger.get().info("BTPROBE", lines[i]);
-                        }
+                    List<String> lines = HmgapidClient.filterBtProbeLines(r.text, 140);
+                    for (int i = 0; i < lines.size(); i++) {
+                        DiagLogger.get().info("BTPROBE", lines.get(i));
                     }
                 } catch (Throwable e) {
                     DiagLogger.get().warn("BTPROBE", "Probe unavailable: " + e.getMessage());

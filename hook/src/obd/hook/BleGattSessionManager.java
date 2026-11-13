@@ -144,6 +144,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         public final LineEmitter emitter;
         public final boolean genericDefault;
         volatile OutputStream socketOut;
+        volatile boolean asyncConnQueues = false;
         volatile boolean active = true;
         volatile boolean multiConnMode = false;
         volatile boolean scanning = false;
@@ -159,6 +160,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             this.emitter = emitter;
             this.genericDefault = genericDefault;
             this.socketOut = socketOut;
+            this.asyncConnQueues = (socketOut != null);
         }
 
         void emitRaw(String line) {
@@ -181,6 +183,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         final String mac;
         final ClientSession owner;
         final Object attLock = new Object();
+        final Object gattQueueLock = new Object();
+        final List<Runnable> gattOpQueue = new ArrayList<Runnable>();
+        boolean gattWorkerStarted = false;
         final Map<String, DiscoveredChar> charByUuid = new LinkedHashMap<String, DiscoveredChar>();
         final Map<Integer, DiscoveredChar> charByValHandle = new LinkedHashMap<Integer, DiscoveredChar>();
         final Set<String> protectedWriteUuids = new HashSet<String>();
@@ -189,6 +194,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         volatile boolean closingRequested = false;
         volatile int attMtu = DEFAULT_ATT_MTU;
         volatile int preferredServerMtu = DEFAULT_ATT_MTU;
+        volatile int connIntervalUnits = 0;
+        volatile int connLatency = 0;
+        volatile int connTimeoutUnits = 0;
 
         // Per-handle outbound LE ACL credit count (protected by hciLock)
         int inflightAcl = 0;
@@ -207,6 +215,73 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             this.mac = mac;
             this.owner = owner;
             this.preferredServerMtu = clampMtu(initialServerMtu);
+        }
+
+        boolean enqueueGattOp(final ModContext mod, Runnable op) {
+            synchronized (gattQueueLock) {
+                if (closed || closingRequested || owner.closingSession || !owner.active) {
+                    return false;
+                }
+                if (gattOpQueue.size() >= 64) {
+                    return false;
+                }
+                gattOpQueue.add(op);
+                if (!gattWorkerStarted) {
+                    gattWorkerStarted = true;
+                    Thread t = new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            runGattQueueLoop(mod);
+                        }
+                    }, "Gen5wConn-" + mac);
+                    t.setDaemon(true);
+                    t.start();
+                } else {
+                    gattQueueLock.notifyAll();
+                }
+                return true;
+            }
+        }
+
+        private void runGattQueueLoop(ModContext mod) {
+            while (true) {
+                Runnable op;
+                synchronized (gattQueueLock) {
+                    while (gattOpQueue.isEmpty()
+                            && !closed
+                            && !closingRequested
+                            && !owner.closingSession
+                            && owner.active) {
+                        try {
+                            gattQueueLock.wait(500L);
+                        } catch (InterruptedException ie) {
+                            return;
+                        }
+                    }
+                    if (closed || closingRequested || owner.closingSession || !owner.active) {
+                        gattOpQueue.clear();
+                        return;
+                    }
+                    if (gattOpQueue.isEmpty()) {
+                        continue;
+                    }
+                    op = gattOpQueue.remove(0);
+                }
+                try {
+                    op.run();
+                } catch (Throwable err) {
+                    if (mod != null) {
+                        mod.log("BleGattSessionManager conn op err (" + mac + "): " + err);
+                    }
+                }
+            }
+        }
+
+        void abortGattQueue() {
+            synchronized (gattQueueLock) {
+                gattOpQueue.clear();
+                gattQueueLock.notifyAll();
+            }
         }
     }
 
@@ -232,6 +307,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     private final Object hciLock = new Object();
     private final Object scanOpLock = new Object();
     private final Object connectOpLock = new Object();
+    private final Object rxReplyLock = new Object();
+    private final List<Runnable> rxReplyQueue = new ArrayList<Runnable>();
+    private boolean rxReplyWorkerStarted = false;
     private final AtomicInteger nextSessionId = new AtomicInteger(1);
 
     private final List<ClientSession> activeSessions = new CopyOnWriteArrayList<ClientSession>();
@@ -265,9 +343,47 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         this.transport = transport;
     }
 
+    private void enqueueRxReply(Runnable task) {
+        if (task == null) return;
+        synchronized (rxReplyLock) {
+            if (rxReplyQueue.size() >= 64) {
+                return;
+            }
+            rxReplyQueue.add(task);
+            if (!rxReplyWorkerStarted) {
+                rxReplyWorkerStarted = true;
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        while (true) {
+                            Runnable next;
+                            synchronized (rxReplyLock) {
+                                while (rxReplyQueue.isEmpty()) {
+                                    try {
+                                        rxReplyLock.wait(1000L);
+                                    } catch (InterruptedException ie) {
+                                        return;
+                                    }
+                                }
+                                next = rxReplyQueue.remove(0);
+                            }
+                            try {
+                                next.run();
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                }, "Gen5wBleRxReply");
+                t.setDaemon(true);
+                t.start();
+            } else {
+                rxReplyLock.notifyAll();
+            }
+        }
+    }
+
     public String describeActiveSessions() {
         int sessCount = activeSessions.size();
-        StringBuilder sb = new StringBuilder(128);
+        StringBuilder sb = new StringBuilder(160);
         sb.append("sessions=").append(sessCount);
         synchronized (hciLock) {
             sb.append(" connections=").append(connectionsByHandle.size())
@@ -285,7 +401,13 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     sb.append(c.mac)
                             .append("@0x").append(Integer.toHexString(c.handle))
                             .append("(mtu=").append(c.attMtu)
-                            .append(",acl=").append(c.inflightAcl).append(')');
+                            .append(",acl=").append(c.inflightAcl);
+                    if (c.connIntervalUnits > 0) {
+                        sb.append(",int=").append(c.connIntervalUnits)
+                                .append(",lat=").append(c.connLatency)
+                                .append(",to=").append(c.connTimeoutUnits);
+                    }
+                    sb.append(')');
                 }
                 sb.append(']');
             }
@@ -506,6 +628,11 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             session.emitRaw("PONG");
             return;
         }
+        if ("STATUS".equals(verb)) {
+            session.emitRaw("BRIDGE_STATUS " + describeActiveSessions()
+                    + " | " + BtNativeBridge.describeTelemetryNonInit());
+            return;
+        }
         if ("MULTICONN".equals(verb)) {
             boolean en = parts.length < 2 || !"0".equals(parts[1]);
             session.multiConnMode = en;
@@ -564,55 +691,133 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             return;
         }
         if ("REQUEST_MTU".equals(verb) && parts.length >= 2) {
-            int desiredMtu = parsePositiveInt(parts[1], DEFAULT_ATT_MTU);
-            handleRequestMtu(session, explicitMac, desiredMtu);
+            final int desiredMtu = parsePositiveInt(parts[1], DEFAULT_ATT_MTU);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "REQUEST_MTU", new Runnable() {
+                @Override
+                public void run() {
+                    handleRequestMtu(session, targetMac, desiredMtu);
+                }
+            });
             return;
         }
         if ("PROTECT_CHAR".equals(verb) && parts.length >= 2) {
-            String uuid = normalizeUuidKey(parts[1]);
-            handleProtectChar(session, explicitMac, uuid);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "PROTECT_CHAR " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleProtectChar(session, targetMac, uuid);
+                }
+            });
             return;
         }
         if ("ENABLE_NOTIFY".equals(verb) && parts.length >= 2) {
-            String uuid = normalizeUuidKey(parts[1]);
-            handleEnableNotify(session, explicitMac, uuid);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "ENABLE_NOTIFY " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleEnableNotify(session, targetMac, uuid);
+                }
+            });
             return;
         }
         if ("DISABLE_NOTIFY".equals(verb) && parts.length >= 2) {
-            String uuid = normalizeUuidKey(parts[1]);
-            handleDisableNotify(session, explicitMac, uuid);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "DISABLE_NOTIFY " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleDisableNotify(session, targetMac, uuid);
+                }
+            });
             return;
         }
         if ("READ_CHAR".equals(verb) && parts.length >= 2) {
-            String uuid = normalizeUuidKey(parts[1]);
-            handleReadChar(session, explicitMac, uuid);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "READ_CHAR " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleReadChar(session, targetMac, uuid);
+                }
+            });
             return;
         }
         if ("READ_BLOB".equals(verb) && parts.length >= 3) {
-            String uuid = normalizeUuidKey(parts[1]);
-            int offset = parsePositiveInt(parts[2], 0);
-            handleReadBlob(session, explicitMac, uuid, offset);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final int offset = parsePositiveInt(parts[2], 0);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "READ_BLOB " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleReadBlob(session, targetMac, uuid, offset);
+                }
+            });
             return;
         }
         if ("READ_LONG_CHAR".equals(verb) && parts.length >= 2) {
-            String uuid = normalizeUuidKey(parts[1]);
-            handleReadLongChar(session, explicitMac, uuid);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "READ_LONG_CHAR " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleReadLongChar(session, targetMac, uuid);
+                }
+            });
             return;
         }
         if ("WRITE_CHAR".equals(verb) && parts.length >= 3) {
-            String uuid = normalizeUuidKey(parts[1]);
-            byte[] payload = hexToBytes(parts[2]);
-            handleWriteChar(session, explicitMac, uuid, payload, false);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final byte[] payload = hexToBytes(parts[2]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "WRITE_CHAR " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleWriteChar(session, targetMac, uuid, payload, false);
+                }
+            });
             return;
         }
         if ("WRITE_CHAR_NR".equals(verb) && parts.length >= 3) {
-            String uuid = normalizeUuidKey(parts[1]);
-            byte[] payload = hexToBytes(parts[2]);
-            handleWriteChar(session, explicitMac, uuid, payload, true);
+            final String uuid = normalizeUuidKey(parts[1]);
+            final byte[] payload = hexToBytes(parts[2]);
+            final String targetMac = explicitMac;
+            dispatchConnOp(mod, session, targetMac, "WRITE_CHAR_NR " + uuid, new Runnable() {
+                @Override
+                public void run() {
+                    handleWriteChar(session, targetMac, uuid, payload, true);
+                }
+            });
             return;
         }
 
         session.emitForConn(explicitMac, "ERR UNKNOWN_SESSION_CMD " + sanitizeToken(verb));
+    }
+
+    private void dispatchConnOp(
+            ModContext mod,
+            ClientSession session,
+            String explicitMac,
+            String opErrLabel,
+            Runnable op) {
+        if (!session.asyncConnQueues) {
+            op.run();
+            return;
+        }
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed || conn.closingRequested) {
+            op.run();
+            return;
+        }
+        if (!conn.enqueueGattOp(mod, op)) {
+            if (conn.closed || conn.closingRequested) {
+                session.emitForConn(conn.mac, "OP_ERR " + opErrLabel + " NOT_CONNECTED");
+            } else {
+                session.emitForConn(conn.mac, "OP_ERR " + opErrLabel + " QUEUE_FULL");
+            }
+        }
     }
 
     // ================= SESSION & CONNECTION LIFECYCLE =================
@@ -648,6 +853,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             }
             for (int i = 0; i < list.size(); i++) {
                 list.get(i).closingRequested = true;
+                list.get(i).abortGattQueue();
             }
             synchronized (hciLock) {
                 hciLock.notifyAll();
@@ -669,6 +875,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
         if (conn != null) {
             conn.closingRequested = true;
+            conn.abortGattQueue();
             synchronized (conn.attLock) {
                 conn.attLock.notifyAll();
             }
@@ -683,6 +890,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         for (int i = 0; i < list.size(); i++) {
             LeConnection c = list.get(i);
             c.closingRequested = true;
+            c.abortGattQueue();
             synchronized (c.attLock) {
                 c.attLock.notifyAll();
             }
@@ -1043,6 +1251,16 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
                 int handle = u16le(connEvt, 4) & 0x0FFF;
                 established = new LeConnection(handle, mac, session, session.defaultServerMtu);
+                int subEvt = connEvt[2] & 0xFF;
+                if (subEvt == 0x01 && connEvt.length >= 20) {
+                    established.connIntervalUnits = u16le(connEvt, 14);
+                    established.connLatency = u16le(connEvt, 16);
+                    established.connTimeoutUnits = u16le(connEvt, 18);
+                } else if (subEvt == 0x0A && connEvt.length >= 32) {
+                    established.connIntervalUnits = u16le(connEvt, 26);
+                    established.connLatency = u16le(connEvt, 28);
+                    established.connTimeoutUnits = u16le(connEvt, 30);
+                }
                 String resolvedFilter = resolveServiceFilter(session, explicitServiceFilter);
                 if (!session.genericDefault && "fff0".equals(resolvedFilter)) {
                     established.protectedWriteUuids.add("fff1");
@@ -1111,6 +1329,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     private void disconnectConnection(LeConnection conn, boolean emitEvent, String reason) {
         if (conn == null) return;
         conn.closingRequested = true;
+        conn.abortGattQueue();
         boolean wasOpen = false;
         synchronized (hciLock) {
             if (!conn.closed) {
@@ -1765,7 +1984,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             return;
         }
 
-        byte[] rsp = transactAtt(conn, pdu, 3000L);
+        byte[] rsp = transactAtt(conn, pdu, 1500L);
         if (rsp != null && (rsp[0] & 0xFF) == ATT_WRITE_RSP) {
             session.emitForConn(conn.mac, "OP_OK " + opName + " " + shortUuid);
         } else if (rsp != null && (rsp[0] & 0xFF) == ATT_ERROR_RSP && rsp.length >= 5) {
@@ -1918,9 +2137,10 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             maxAclData = controllerLeAclMaxLen;
         }
         List<byte[]> fragments = fragmentL2capIntoAclPackets(handle, cid, l2capPayload, maxAclData);
-        long deadline = System.currentTimeMillis() + creditWaitMs;
+        long perFragWaitMs = Math.max(60L, Math.min(creditWaitMs, 180L));
 
         for (int i = 0; i < fragments.size(); i++) {
+            long deadline = System.currentTimeMillis() + perFragWaitMs;
             synchronized (hciLock) {
                 while (connectionsByHandle.containsKey(Integer.valueOf(handle))
                         && inflightLeAclPkts >= maxLeAclCredits) {
@@ -1933,7 +2153,6 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                         if (!reclaimStaleAclCreditLocked(target)) {
                             return false;
                         }
-                        deadline = System.currentTimeMillis() + 250L;
                         break;
                     }
                     try {
@@ -2044,6 +2263,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 }
             }
             if (dropped != null) {
+                dropped.abortGattQueue();
                 transport.setFilterState(true, BtNativeBridge.encodeUntrackHandle(h));
                 synchronized (dropped.owner.ownedByMac) {
                     if (dropped.owner.ownedByMac.get(dropped.mac) == dropped) {
@@ -2084,6 +2304,29 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 synchronized (hciLock) {
                     pendingLeConnEvent = ev;
                     hciLock.notifyAll();
+                }
+            } else if (sub == 0x03 && ev.length >= 12) { // LE_Connection_Update_Complete
+                int st = ev[3] & 0xFF;
+                int h = u16le(ev, 4) & 0x0FFF;
+                int interval = u16le(ev, 6);
+                int latency = u16le(ev, 8);
+                int timeout = u16le(ev, 10);
+                LeConnection updatedConn;
+                synchronized (hciLock) {
+                    updatedConn = connectionsByHandle.get(Integer.valueOf(h));
+                }
+                if (updatedConn != null && !updatedConn.closed) {
+                    if (st == 0) {
+                        updatedConn.connIntervalUnits = interval;
+                        updatedConn.connLatency = latency;
+                        updatedConn.connTimeoutUnits = timeout;
+                        updatedConn.owner.emitForConn(updatedConn.mac,
+                                "CONN_PARAM UPDATED interval=" + interval
+                                        + " lat=" + latency + " timeout=" + timeout);
+                    } else {
+                        updatedConn.owner.emitForConn(updatedConn.mac,
+                                "CONN_PARAM UPDATE_ERR status=0x" + Integer.toHexString(st));
+                    }
                 }
             }
         }
@@ -2150,29 +2393,50 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         if (conn == null || conn.closed || pdu.length == 0) return;
 
         if (cid == L2CAP_CID_LE_SIGNALING) {
-            // L2CAP Connection Parameter Update Request (0x12) from peripheral
+            // L2CAP Connection Parameter Update Request (0x12) from peripheral (e.g. QN902x 20s timer).
+            // Offloaded to Gen5wBleRxReply so ObdHciRxReader NEVER blocks on ACL credits or HCI status,
+            // and rejects slow power-saving intervals (>60ms minInt) that stall multi-frame ISO-TP GATT!
             if ((pdu[0] & 0xFF) == 0x12 && pdu.length >= 12) {
-                byte identifier = pdu[1];
+                final byte identifier = pdu[1];
                 final int minInt = u16le(pdu, 4);
                 final int maxInt = u16le(pdu, 6);
                 final int latency = u16le(pdu, 8);
                 final int timeout = u16le(pdu, 10);
+                final boolean accept = shouldAcceptConnParamUpdate(minInt, maxInt, latency, timeout);
 
-                // Accept (0x0000) on CID 0x0005
-                byte[] rsp = new byte[]{0x13, identifier, 0x02, 0x00, 0x00, 0x00};
-                sendL2capPdu(conn.handle, L2CAP_CID_LE_SIGNALING, rsp, 500L);
-
-                if (minInt >= 6 && maxInt >= minInt && maxInt <= 3200 && timeout >= 10 && timeout <= 3200) {
-                    byte[] upd = new byte[]{
-                            (byte) (conn.handle & 0xFF), (byte) ((conn.handle >> 8) & 0x0F),
-                            (byte) (minInt & 0xFF), (byte) ((minInt >> 8) & 0xFF),
-                            (byte) (maxInt & 0xFF), (byte) ((maxInt >> 8) & 0xFF),
-                            (byte) (latency & 0xFF), (byte) ((latency >> 8) & 0xFF),
-                            (byte) (timeout & 0xFF), (byte) ((timeout >> 8) & 0xFF),
-                            0x00, 0x00, 0x00, 0x00
-                    };
-                    transport.sendHciCommand(buildHciCommandPacket(HCI_LE_CONNECTION_UPDATE, upd));
-                }
+                enqueueRxReply(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (conn.closed || conn.closingRequested) return;
+                        if (!accept) {
+                            byte[] rejectRsp = new byte[]{0x13, identifier, 0x02, 0x00, 0x01, 0x00};
+                            sendL2capPdu(conn.handle, L2CAP_CID_LE_SIGNALING, rejectRsp, 500L);
+                            conn.owner.emitForConn(conn.mac,
+                                    "CONN_PARAM REJECTED min=" + minInt + " max=" + maxInt
+                                            + " lat=" + latency + " timeout=" + timeout);
+                            return;
+                        }
+                        int effMaxInt = Math.max(minInt, Math.min(maxInt, 48));
+                        int effLatency = 0;
+                        int effTimeout = Math.max(timeout, 400);
+                        byte[] acceptRsp = new byte[]{0x13, identifier, 0x02, 0x00, 0x00, 0x00};
+                        sendL2capPdu(conn.handle, L2CAP_CID_LE_SIGNALING, acceptRsp, 500L);
+                        conn.owner.emitForConn(conn.mac,
+                                "CONN_PARAM ACCEPTED min=" + minInt + " max=" + effMaxInt
+                                        + " lat=" + effLatency + " timeout=" + effTimeout);
+                        sleepQuietly(40L);
+                        if (conn.closed || conn.closingRequested) return;
+                        byte[] upd = new byte[]{
+                                (byte) (conn.handle & 0xFF), (byte) ((conn.handle >> 8) & 0x0F),
+                                (byte) (minInt & 0xFF), (byte) ((minInt >> 8) & 0xFF),
+                                (byte) (effMaxInt & 0xFF), (byte) ((effMaxInt >> 8) & 0xFF),
+                                (byte) (effLatency & 0xFF), (byte) ((effLatency >> 8) & 0xFF),
+                                (byte) (effTimeout & 0xFF), (byte) ((effTimeout >> 8) & 0xFF),
+                                0x00, 0x00, 0x00, 0x00
+                        };
+                        sendHciCmdStatusSync(HCI_LE_CONNECTION_UPDATE, upd, 1000L);
+                    }
+                });
             }
             return;
         }
@@ -2184,19 +2448,31 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         int attOp = pdu[0] & 0xFF;
         if (attOp == ATT_EXCHANGE_MTU_REQ && pdu.length >= 3) {
             int peerRxMtu = u16le(pdu, 1);
-            int ourMaxMtu = conn.preferredServerMtu;
+            final int ourMaxMtu = conn.preferredServerMtu;
             conn.attMtu = Math.max(DEFAULT_ATT_MTU, Math.min(peerRxMtu, ourMaxMtu));
-            sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{
-                    (byte) ATT_EXCHANGE_MTU_RSP,
-                    (byte) (ourMaxMtu & 0xFF),
-                    (byte) ((ourMaxMtu >> 8) & 0xFF)
-            }, 500L);
+            enqueueRxReply(new Runnable() {
+                @Override
+                public void run() {
+                    if (conn.closed || conn.closingRequested) return;
+                    sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{
+                            (byte) ATT_EXCHANGE_MTU_RSP,
+                            (byte) (ourMaxMtu & 0xFF),
+                            (byte) ((ourMaxMtu >> 8) & 0xFF)
+                    }, 500L);
+                }
+            });
             return;
         }
 
         if (attOp == ATT_HANDLE_VALUE_NTF || attOp == ATT_HANDLE_VALUE_IND) {
             if (attOp == ATT_HANDLE_VALUE_IND) {
-                sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{(byte) ATT_HANDLE_VALUE_CFM}, 500L);
+                enqueueRxReply(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (conn.closed || conn.closingRequested) return;
+                        sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{(byte) ATT_HANDLE_VALUE_CFM}, 500L);
+                    }
+                });
             }
             if (pdu.length >= 3) {
                 int valHandle = u16le(pdu, 1);
@@ -2228,6 +2504,20 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     }
 
     // ================= PURE STATIC CODECS (HOST-UNIT-TESTABLE) =================
+
+    /**
+     * Validates an L2CAP {@code 0x12} Connection Parameter Update Request from a BLE peripheral.
+     * Rejects slow power-saving connection intervals ({@code minInt > 48} = {@code > 60 ms}) or
+     * non-trivial slave latency ({@code latency > 1}) so multi-frame ISO-TP GATT notifications
+     * never exceed command timeouts or desynchronize ELM327 {@code '>'} prompts.
+     */
+    public static boolean shouldAcceptConnParamUpdate(int minInt, int maxInt, int latency, int timeout) {
+        if (minInt < 6 || maxInt < minInt || maxInt > 3200) return false;
+        if (latency < 0 || latency > 499) return false;
+        if (timeout < 10 || timeout > 3200) return false;
+        if ((timeout * 4) <= (1 + latency) * maxInt) return false;
+        return minInt <= 48 && latency <= 1 && timeout >= 100;
+    }
 
     public static int clampMtu(int mtu) {
         if (mtu < DEFAULT_ATT_MTU) return DEFAULT_ATT_MTU;

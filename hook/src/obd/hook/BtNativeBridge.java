@@ -171,7 +171,11 @@ public final class BtNativeBridge {
     }
 
     public static String describeStatus(ModContext mod, LoadedApp app) {
-        boolean ok = ensureInitialized(mod, app);
+        ensureInitialized(mod, app);
+        return describeTelemetryNonInit();
+    }
+
+    public static String describeTelemetryNonInit() {
         int hookInstalled = -1;
         int workerAlive = -1;
         int rxEvt = -1;
@@ -196,7 +200,7 @@ public final class BtNativeBridge {
         }
         return String.format(Locale.US,
                 "ready=%s soLoaded=%s path=%s initRc=%d err=%s hookInstalled=%d worker=%d activeHandle=0x%04x activeHandles=%d txHci=%d txAcl=%d rxEvt=%d rxAcl=%d rxDrop=%d",
-                Boolean.valueOf(ok), Boolean.valueOf(soLoaded), loadedSoPath,
+                Boolean.valueOf(initialized), Boolean.valueOf(soLoaded), loadedSoPath,
                 Integer.valueOf(lastInitRc), lastInitError,
                 Integer.valueOf(hookInstalled), Integer.valueOf(workerAlive),
                 Integer.valueOf(activeHandle & 0xFFFF),
@@ -306,6 +310,7 @@ public final class BtNativeBridge {
                 "/data/app-lib/obd.app-1",
                 "/data/app-lib/obd.app-2",
                 "/data/app-lib/obd.app-3",
+                "/data/app-lib/obd.app-4",
                 "/data/app-lib/obd.app"
         };
         for (int i = 0; i < fallbackDirs.length; i++) {

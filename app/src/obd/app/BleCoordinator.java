@@ -647,15 +647,18 @@ public final class BleCoordinator {
         }
 
         if (ver != null && !ver.isEmpty()) {
-            String cleanVer = ver.replace('\r', ' ').replace('\n', ' ').trim();
-            if (cleanVer.length() > 28) cleanVer = cleanVer.substring(0, 28);
-            elmVersionText = cleanVer;
-            DiagLogger.get().info("OBD", "Adapter identified (" + obdBinding.profileName + "): " + cleanVer);
+            String cleanVer = Elm327Protocol.cleanAdapterVersion(ver);
+            if (!cleanVer.isEmpty()) {
+                elmVersionText = cleanVer;
+            }
+            DiagLogger.get().info("OBD", "Adapter identified (" + obdBinding.profileName + "): "
+                    + (cleanVer.isEmpty() ? ver.trim() : cleanVer));
         } else {
             DiagLogger.get().warn("OBD", "No initial ATI/ATZ prompt on " + obdMac + "; proceeding to E-GMP init");
         }
 
         runElmInitSequence();
+        boolean hadLiveSessionResponse = (ver != null && !ver.isEmpty());
 
         String currentCanHeader = "";
         int cycle = 0;
@@ -721,7 +724,7 @@ public final class BleCoordinator {
                         : new String[] { "220102", "220103", "220104", "22010A", "22010B", "22010C" };
                 int okBlocks = 0;
                 for (int i = 0; i < cellDids.length && obdConnected && bridgeClientCount == 0; i++) {
-                    if (queryIsoTpAndApply(cellDids[i], 1400L)) {
+                    if (queryIsoTpAndApply(cellDids[i], 2000L)) {
                         okBlocks++;
                     }
                 }
@@ -738,12 +741,12 @@ public final class BleCoordinator {
                     sendElmCommandBlocking("ATAR", 800L);
                     currentCanHeader = "";
                 }
-                gotData |= queryIsoTpAndApply("010D", 900L);
-                gotData |= queryIsoTpAndApply("010C", 900L);
+                gotData |= queryIsoTpAndApply("010D", 1100L);
+                gotData |= queryIsoTpAndApply("010C", 1100L);
                 if ((cycle % 3) == 0) {
-                    gotData |= queryIsoTpAndApply("0105", 900L);
-                    gotData |= queryIsoTpAndApply("0142", 900L);
-                    String rv = sendElmCommandBlocking("ATRV", 800L);
+                    gotData |= queryIsoTpAndApply("0105", 1100L);
+                    gotData |= queryIsoTpAndApply("0142", 1100L);
+                    String rv = sendElmCommandBlocking("ATRV", 900L);
                     telemetry.updateAtRvVolts(Elm327Protocol.parseAtRvVolts(rv));
                 }
                 rateCommands += 2;
@@ -752,18 +755,18 @@ public final class BleCoordinator {
 
                 // Keep 7E4/7EC selected across BMS fast (220101) + medium (220105, 220106) queries
                 currentCanHeader = switchTargetEcu(currentCanHeader, "7E4", "7EC");
-                gotData |= queryIsoTpAndApply("220101", 1300L);
+                gotData |= queryIsoTpAndApply("220101", 2200L);
                 rateCommands++;
                 if (medCycle) {
-                    gotData |= queryIsoTpAndApply("220105", 1300L);
-                    gotData |= queryIsoTpAndApply("220106", 1100L);
+                    gotData |= queryIsoTpAndApply("220105", 2000L);
+                    gotData |= queryIsoTpAndApply("220106", 1600L);
                     rateCommands += 2;
                 }
 
                 // ABS/ESC 7D1 -> 7D9: Speed & Gear
                 if (bridgeClientCount == 0) {
                     currentCanHeader = switchTargetEcu(currentCanHeader, "7D1", "7D9");
-                    gotData |= queryIsoTpAndApply("220104", 900L);
+                    gotData |= queryIsoTpAndApply("220104", 1500L);
                     rateCommands++;
                 }
 
@@ -771,7 +774,7 @@ public final class BleCoordinator {
                 if (medCycle && bridgeClientCount == 0) {
                     currentCanHeader = switchTargetEcu(currentCanHeader, "7E5", "7ED");
                     String iccuCmd = iccuUseMy25Did ? "22E101" : "22E011";
-                    boolean iccuOk = queryIsoTpAndApply(iccuCmd, 1100L);
+                    boolean iccuOk = queryIsoTpAndApply(iccuCmd, 1600L);
                     if (!iccuOk) {
                         iccuUseMy25Did = !iccuUseMy25Did;
                     }
@@ -782,13 +785,17 @@ public final class BleCoordinator {
                 // E-GMP Slow Cycle: TPMS 22C00B + Cluster Odometer 22B002 + Adapter ATRV
                 if ((cycle % 10) == 0 && bridgeClientCount == 0) {
                     currentCanHeader = switchTargetEcu(currentCanHeader, "7A0", "7A8");
-                    gotData |= queryIsoTpAndApply("22C00B", 1100L);
+                    gotData |= queryIsoTpAndApply("22C00B", 1600L);
 
                     currentCanHeader = switchTargetEcu(currentCanHeader, "7C6", "7CE");
-                    gotData |= queryIsoTpAndApply("22B002", 1000L);
+                    gotData |= queryIsoTpAndApply("22B002", 1500L);
 
-                    String rv = sendElmCommandBlocking("ATRV", 800L);
-                    telemetry.updateAtRvVolts(Elm327Protocol.parseAtRvVolts(rv));
+                    String rv = sendElmCommandBlocking("ATRV", 1000L);
+                    float parsedRv = Elm327Protocol.parseAtRvVolts(rv);
+                    if (!Float.isNaN(parsedRv)) {
+                        hadLiveSessionResponse = true;
+                        telemetry.updateAtRvVolts(parsedRv);
+                    }
                     rateCommands += 3;
                 }
             }
@@ -803,17 +810,40 @@ public final class BleCoordinator {
             }
 
             if (gotData) {
+                hadLiveSessionResponse = true;
                 consecutiveNoData = 0;
                 obdStatusText = "Online (" + shortLabel(obdName, obdMac) + ")";
                 notifyUi();
                 sleepQuiet(60L);
             } else {
                 consecutiveNoData++;
-                if (consecutiveNoData == 4) {
-                    DiagLogger.get().warn("OBD", "4 consecutive empty cycles on " + obdMac + "; entering 5s standby");
+                if (consecutiveNoData == 3) {
+                    bleClient.requestBridgeStatus();
                 }
-                if (consecutiveNoData >= 4) {
-                    // Vehicle CAN is asleep (IG OFF) — back off to 5s standby so 12V battery rests
+                if (consecutiveNoData >= 3 && obdConnected && bridgeClientCount == 0) {
+                    // Distinguish genuine IG OFF (adapter still answers ATI immediately from Pin 16 +12V)
+                    // from a stalled BLE UART link (ATI itself times out -> auto-cycle BLE session).
+                    String alive = sendElmCommandBlocking("ATI", 1100L);
+                    if (alive == null || alive.trim().isEmpty()) {
+                        String targetMac = obdMac;
+                        long retryDelayMs = hadLiveSessionResponse ? 1500L : 5000L;
+                        DiagLogger.get().warn("OBD", "Adapter unresponsive to ATI keepalive on "
+                                + targetMac + "; cycling BLE link (reconnecting in " + retryDelayMs + " ms)");
+                        obdConnected = false;
+                        obdConnecting = false;
+                        nextObdReconnectMs = System.currentTimeMillis() + retryDelayMs;
+                        obdStatusText = "Reconnecting BLE...";
+                        bleClient.disconnectDevice(targetMac);
+                        notifyUi();
+                        scheduleReconnectKick(retryDelayMs + 150L);
+                        break;
+                    }
+                    hadLiveSessionResponse = true;
+                    if (consecutiveNoData == 3) {
+                        DiagLogger.get().info("OBD", "Vehicle CAN idle on " + obdMac
+                                + " (adapter alive: " + Elm327Protocol.cleanAdapterVersion(alive)
+                                + "); entering 5s IG OFF standby");
+                    }
                     pollHz = 0.2f;
                     obdStatusText = "Standby (IG OFF)";
                     notifyUi();
@@ -827,6 +857,20 @@ public final class BleCoordinator {
         pollHz = 0.0f;
     }
 
+    private void scheduleReconnectKick(final long delayMs) {
+        Thread kick = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                sleepQuiet(Math.max(200L, delayMs));
+                if (!stopWorker.get() && (uiForeground || keepAliveBackground) && bleClient.isBridgeOpen()) {
+                    ensureConfiguredDevicesConnected();
+                }
+            }
+        }, "ObdFastReconnect");
+        kick.setDaemon(true);
+        kick.start();
+    }
+
     private void runElmInitSequence() {
         for (int i = 0; i < Elm327Protocol.EGMP_INIT_COMMANDS.length; i++) {
             if (!obdConnected || bridgeClientCount > 0) break;
@@ -838,8 +882,8 @@ public final class BleCoordinator {
         if (txHeader.equals(currentHeader)) {
             return currentHeader;
         }
-        sendElmCommandBlocking("ATSH" + txHeader, 800L);
-        sendElmCommandBlocking("ATCRA" + rxFilter, 800L);
+        sendElmCommandBlocking("ATSH" + txHeader, 900L);
+        sendElmCommandBlocking("ATCRA" + rxFilter, 900L);
         return txHeader;
     }
 
@@ -847,8 +891,8 @@ public final class BleCoordinator {
         if ("7DF".equals(currentHeader)) {
             return currentHeader;
         }
-        sendElmCommandBlocking("ATSH7DF", 800L);
-        sendElmCommandBlocking("ATAR", 800L);
+        sendElmCommandBlocking("ATSH7DF", 900L);
+        sendElmCommandBlocking("ATAR", 900L);
         return "7DF";
     }
 
@@ -893,6 +937,7 @@ public final class BleCoordinator {
             bleClient.writeCharacteristic(mac, binding.writeUuid, chunks.get(i), binding.writeWithoutResponse);
         }
         long deadline = System.currentTimeMillis() + Math.max(200L, timeoutMs);
+        String result;
         synchronized (promptLock) {
             while (latestPromptResponse == null && obdConnected && bridgeClientCount == 0) {
                 long rem = deadline - System.currentTimeMillis();
@@ -904,7 +949,37 @@ public final class BleCoordinator {
                     break;
                 }
             }
-            return latestPromptResponse;
+            result = latestPromptResponse;
+        }
+        // If a multi-frame command timed out before '>' arrived (e.g., slow SEARCHING... or late CAN burst),
+        // send a bare CR to abort any in-flight ELM327 CAN wait and drain '>' so the next command never
+        // suffers off-by-one '>' prompt desynchronization!
+        if (result == null && obdConnected && bridgeClientCount == 0
+                && !"ATI".equalsIgnoreCase(cmd) && !"ATZ".equalsIgnoreCase(cmd)) {
+            resyncElmPrompt(mac, binding, 450L);
+        }
+        return result;
+    }
+
+    private void resyncElmPrompt(String mac, Elm327Protocol.GattBinding binding, long drainMs) {
+        synchronized (promptLock) {
+            latestPromptResponse = null;
+        }
+        bleClient.writeCharacteristic(mac, binding.writeUuid, new byte[] { '\r' }, binding.writeWithoutResponse);
+        long deadline = System.currentTimeMillis() + Math.max(100L, drainMs);
+        synchronized (promptLock) {
+            while (latestPromptResponse == null && obdConnected && bridgeClientCount == 0) {
+                long rem = deadline - System.currentTimeMillis();
+                if (rem <= 0L) break;
+                try {
+                    promptLock.wait(rem);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            latestPromptResponse = null;
+            promptBuffer.reset();
         }
     }
 
@@ -1380,6 +1455,25 @@ public final class BleCoordinator {
                     }
                 }
             }
+        }
+
+        @Override
+        public void onCharacteristicWrite(String mac, String uuid, String error) {
+            if (error != null && mac != null) {
+                DiagLogger.get().warn("BLE", "WRITE error on " + mac.toUpperCase(Locale.US)
+                        + " uuid=" + Elm327Protocol.normUuid(uuid) + ": " + error);
+            }
+        }
+
+        @Override
+        public void onConnectionParamsUpdated(String mac, String summary) {
+            DiagLogger.get().info("BLE", "Conn params " + (mac != null && !mac.isEmpty() ? (mac + " ") : "")
+                    + summary);
+        }
+
+        @Override
+        public void onBridgeStatus(String status) {
+            DiagLogger.get().info("BLE", "Bridge status: " + status);
         }
 
         @Override
