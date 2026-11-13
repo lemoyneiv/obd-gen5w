@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Verified Hyundai Ioniq 5 / Kia EV6 / Genesis GV60 (E-GMP) UDS Mode 0x22 & SAE J1979 Mode 0x01
@@ -136,6 +137,7 @@ public final class EgmpTelemetry {
         public int speedKmh = -1;
         public String gear = "-";
         public long odometerKm = -1L;
+        public long odometerMiles = -1L;
         public int genericRpm = -1;
 
         // Lifetime cumulative BMS counters
@@ -236,6 +238,7 @@ public final class EgmpTelemetry {
             copy.speedKmh = live.speedKmh;
             copy.gear = live.gear;
             copy.odometerKm = live.odometerKm;
+            copy.odometerMiles = live.odometerMiles;
             copy.genericRpm = live.genericRpm;
 
             copy.cumChargeAh = live.cumChargeAh;
@@ -253,6 +256,69 @@ public final class EgmpTelemetry {
         synchronized (lock) {
             live.adapterAtRvVolts = volts;
             live.lastUpdateMs = System.currentTimeMillis();
+        }
+    }
+
+    /**
+     * Applies read-only HMG-API vehicle readings as non-overwriting fallbacks when direct OBD
+     * ABS ({@code 7D9}) or Cluster ({@code 7CE}) frames have not yet arrived.
+     */
+    public void applyHmgVehicleSignals(Map<String, String> sigs) {
+        if (sigs == null || sigs.isEmpty()) return;
+        synchronized (lock) {
+            if (!live.hasAbs) {
+                String sp = sigs.get("speed");
+                if (sp != null && !sp.isEmpty()) {
+                    String lowerSp = sp.trim().toLowerCase(Locale.US);
+                    boolean isMph = lowerSp.endsWith("mph");
+                    String numSp = lowerSp.replaceAll("[^0-9.\\-]", "");
+                    if (!numSp.isEmpty()) {
+                        try {
+                            float raw = Float.parseFloat(numSp);
+                            int kmh = Math.round(isMph ? (raw * 1.609344f) : raw);
+                            if (kmh >= 0 && kmh <= 300) {
+                                live.speedKmh = kmh;
+                            }
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+                String park = sigs.get("gear.park");
+                if (park != null && "-".equals(live.gear)) {
+                    if ("true".equalsIgnoreCase(park) || "1".equals(park)) {
+                        live.gear = "P";
+                    }
+                }
+                String gearSig = sigs.get("gear");
+                if (gearSig != null && !gearSig.trim().isEmpty() && "-".equals(live.gear)) {
+                    live.gear = gearSig.trim().toUpperCase(Locale.US);
+                }
+            }
+            if (!live.hasCluster) {
+                String odo = sigs.get("odometer");
+                if (odo != null && !odo.isEmpty()) {
+                    String lowerOdo = odo.trim().toLowerCase(Locale.US);
+                    boolean isMi = lowerOdo.endsWith("mi") || lowerOdo.contains(" mile");
+                    String numOdo = lowerOdo.replaceAll("[^0-9.]", "");
+                    if (!numOdo.isEmpty()) {
+                        try {
+                            double val = Double.parseDouble(numOdo);
+                            if (isMi) {
+                                long mi = Math.round(val);
+                                if (mi > 0 && mi < 1_500_000L) {
+                                    live.odometerMiles = mi;
+                                    live.odometerKm = Math.round(mi * 1.609344d);
+                                }
+                            } else {
+                                long km = Math.round(val);
+                                if (km > 0 && km < 2_000_000L) {
+                                    live.odometerKm = km;
+                                    live.odometerMiles = Math.round(km * 0.621371d);
+                                }
+                            }
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+            }
         }
     }
 
@@ -304,7 +370,6 @@ public final class EgmpTelemetry {
             }
             recountModulesLocked();
 
-            live.battInletTempC = (int) uds[25];
             live.cellMaxVolts = (uds[26] & 0xFF) / 50.0f;
             live.cellMaxIndex = uds[27] & 0xFF;
             live.cellMinVolts = (uds[28] & 0xFF) / 50.0f;
@@ -353,18 +418,31 @@ public final class EgmpTelemetry {
             return true;
         }
 
-        // 3. BMS 7EC -> 22 0106 (Coolant Temp, Thermal Management Mode, Charging Flag)
+        // 3. BMS 7EC -> 22 0106 (Coolant Temp, Pack Inlet Temp, Thermal Management Mode, Charging Flag)
         if (did == 0x0106 && uds.length >= 28 && (canId == CAN_BMS_RX || canId == -1)) {
             live.hasBms0106 = true;
-            live.coolantTempC = (int) uds[7];
+            int rawCoolant = (int) uds[7];
+            if (rawCoolant >= -40 && rawCoolant <= 120) {
+                live.coolantTempC = rawCoolant;
+            }
+            if (uds.length >= 10) {
+                int rawInlet = (int) uds[9];
+                if (rawInlet == 0 && live.battTempMinC >= 12 && rawCoolant >= 12) {
+                    live.battInletTempC = rawCoolant;
+                } else if (rawInlet >= -40 && rawInlet <= 120) {
+                    live.battInletTempC = rawInlet;
+                }
+            } else if (live.battInletTempC == Integer.MIN_VALUE && rawCoolant >= -40 && rawCoolant <= 120) {
+                live.battInletTempC = rawCoolant;
+            }
             live.thermalModeRaw = uds[12] & 0xFF;
             boolean chgBit = (uds[27] & 0x01) != 0;
             live.hvCharging = chgBit && (Float.isNaN(live.packPowerKw) || live.packPowerKw <= 0.5f);
             return true;
         }
 
-        // 4. BMS 7EC -> Cell Voltage Blocks 22 0102/0103/0104/010A/010B/010C (>=39 bytes)
-        if ((canId == CAN_BMS_RX || canId == -1) && uds.length >= 39) {
+        // 4. BMS 7EC -> Cell Voltage Blocks 22 0102/0103/0104/010A/010B/010C (39 bytes)
+        if ((canId == CAN_BMS_RX || (canId == -1 && uds.length <= 42)) && uds.length >= 39) {
             int cellBase = -1;
             switch (did) {
                 case 0x0102: cellBase = 0; break;
@@ -380,8 +458,9 @@ public final class EgmpTelemetry {
             }
         }
 
-        // 5. ABS/ESC 7D9 -> 22 0104 (Vehicle Speed & Gear Selector, 12..34 bytes)
-        if (did == 0x0104 && uds.length >= 12 && uds.length < 35 && (canId == CAN_ABS_RX || canId == -1)) {
+        // 5. ABS/ESC 7D9 -> 22 0104 (Vehicle Speed & Gear Selector; 48 bytes on E-GMP CAN)
+        if (did == 0x0104 && uds.length >= 12
+                && (canId == CAN_ABS_RX || (canId == -1 && (uds.length < 39 || uds.length >= 44)))) {
             live.hasAbs = true;
             live.speedKmh = uds[9] & 0xFF;
             int g = uds[11] & 0xFF;
@@ -397,9 +476,9 @@ public final class EgmpTelemetry {
             live.hasIccu = true;
             live.ldcTempC = (uds[12] & 0xFF) - 100;
             live.ldcOutVolts = u16be(uds, 13) / 1000.0f;
-            live.ldcOutAmps = u16be(uds, 15) / 100.0f;
+            live.ldcOutAmps = u16be(uds, 15) / 1000.0f;
             live.ldcHvInVolts = u16be(uds, 17) / 10.0f;
-            live.aux12CurrentA = (u16be(uds, 21) / 100.0f) - 327.0f;
+            live.aux12CurrentA = (u16be(uds, 21) - 32768) / 100.0f;
             int soc12 = uds[23] & 0xFF;
             if (soc12 <= 100) {
                 live.aux12SocPct = soc12;
@@ -426,15 +505,23 @@ public final class EgmpTelemetry {
             return true;
         }
 
-        // 8. Instrument Cluster 7CE -> 22 B002 (Odometer km, >=12 bytes)
+        // 8. Instrument Cluster 7CE -> 22 B002 (Metric km in uds[9..11], or US/UK miles in uds[12..14])
         if (did == 0xB002 && uds.length >= 12 && (canId == CAN_CLUSTER_RX || canId == -1)) {
-            long odo = ((long) (uds[9] & 0xFF) << 16)
-                    | ((long) (uds[10] & 0xFF) << 8)
-                    | (long) (uds[11] & 0xFF);
-            if (odo > 0 && odo < 2_000_000L) {
+            long odoKm = u24be(uds, 9);
+            if (odoKm > 0 && odoKm < 2_000_000L && odoKm != 0xAAAAAAL) {
                 live.hasCluster = true;
-                live.odometerKm = odo;
+                live.odometerKm = odoKm;
+                live.odometerMiles = Math.round(odoKm * 0.621371d);
                 return true;
+            }
+            if (uds.length >= 15) {
+                long odoMi = u24be(uds, 12);
+                if (odoMi > 0 && odoMi < 1_500_000L && odoMi != 0xAAAAAAL) {
+                    live.hasCluster = true;
+                    live.odometerMiles = odoMi;
+                    live.odometerKm = Math.round(odoMi * 1.609344d);
+                    return true;
+                }
             }
         }
 
@@ -612,11 +699,26 @@ public final class EgmpTelemetry {
     }
 
     public static String formatDistance(long km, boolean useMiles) {
-        if (km < 0) return "-- " + (useMiles ? "mi" : "km");
+        return formatDistance(km, -1L, useMiles);
+    }
+
+    public static String formatDistance(long km, long miles, boolean useMiles) {
         if (useMiles) {
-            return String.format(Locale.US, "%,d mi", Math.round(km * 0.621371d));
+            if (miles >= 0) {
+                return String.format(Locale.US, "%,d mi", miles);
+            }
+            if (km >= 0) {
+                return String.format(Locale.US, "%,d mi", Math.round(km * 0.621371d));
+            }
+            return "-- mi";
         }
-        return String.format(Locale.US, "%,d km", km);
+        if (km >= 0) {
+            return String.format(Locale.US, "%,d km", km);
+        }
+        if (miles >= 0) {
+            return String.format(Locale.US, "%,d km", Math.round(miles * 1.609344d));
+        }
+        return "-- km";
     }
 
     public static String formatTirePressure(float psi, boolean useBar) {
@@ -643,6 +745,12 @@ public final class EgmpTelemetry {
 
     public static int s16be(byte[] b, int off) {
         return (short) (((b[off] & 0xFF) << 8) | (b[off + 1] & 0xFF));
+    }
+
+    public static long u24be(byte[] b, int off) {
+        return ((long) (b[off] & 0xFF) << 16)
+                | ((long) (b[off + 1] & 0xFF) << 8)
+                | (long) (b[off + 2] & 0xFF);
     }
 
     public static long u32be(byte[] b, int off) {

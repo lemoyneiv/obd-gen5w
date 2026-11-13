@@ -41,10 +41,10 @@ Run `./build.sh` to build and sign all four installation archives in `dist/`:
 
 | Package | Target Environment |
 |---|---|
-| `obd-gen5w-v0.1.1.hmgapi.zip` | Signed HMG-API `.mod` package (`mod.json` + `mod.sig`) |
-| `obd-gen5w-v0.1.1-hmgapi-usb.zip` | USB root auto-installer (when HMG-API is already installed) |
-| `obd-gen5w-v0.1.1-nemesis-package.zip` | NEMESIS Mod Manager package |
-| `obd-gen5w-v0.1.1-nemesis-usb.zip` | Complete USB bundle including HMG-API runtime + `obd-gen5w` |
+| `obd-gen5w-v0.1.2.hmgapi.zip` | Signed HMG-API `.mod` package (`mod.json` + `mod.sig`) |
+| `obd-gen5w-v0.1.2-hmgapi-usb.zip` | USB root auto-installer (when HMG-API is already installed) |
+| `obd-gen5w-v0.1.2-nemesis-package.zip` | NEMESIS Mod Manager package |
+| `obd-gen5w-v0.1.2-nemesis-usb.zip` | Complete USB bundle including HMG-API runtime + `obd-gen5w` |
 
 > **Coexistence Note:** If `bvm02-gen5w` is also installed on the same head unit, both mods detect an active `@gen5w_ble` socket in `com.android.bluetooth` and share the single BLE bridge cleanly without double-hooking `bplus.default.so`.
 

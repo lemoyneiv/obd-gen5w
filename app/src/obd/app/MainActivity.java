@@ -681,7 +681,7 @@ public final class MainActivity extends Activity implements BleCoordinator.UiLis
                 Float.isNaN(s.cumDischargeKwh) ? "-- kWh" : String.format(Locale.US, "%,.1f kWh", s.cumDischargeKwh),
                 Float.isNaN(s.cumDischargeAh) ? "-- Ah" : String.format(Locale.US, "%,.1f Ah", s.cumDischargeAh),
                 opHours < 0 ? "-- h" : (opHours + " h"),
-                EgmpTelemetry.formatDistance(s.odometerKm, useMi)));
+                EgmpTelemetry.formatDistance(s.odometerKm, s.odometerMiles, useMi)));
 
         // Panel 3: 12V / ICCU & BVM02
         tvIccuLdcMain.setText(String.format(Locale.US, "%s  •  %s",
@@ -803,11 +803,12 @@ public final class MainActivity extends Activity implements BleCoordinator.UiLis
             @Override
             public void run() {
                 final HmgapidClient.ConditioningStatus st = HmgapidClient.queryConditioningStatus();
+                coordinator.getTelemetry().applyHmgVehicleSignals(st.signals);
                 uiHandler.post(new Runnable() {
                     @Override
                     public void run() {
                         lastCondStatus = st;
-                        if (activeTab == TAB_EV) {
+                        if (activeTab == TAB_EV || activeTab == TAB_CELLS) {
                             renderAll();
                         }
                     }
@@ -833,6 +834,7 @@ public final class MainActivity extends Activity implements BleCoordinator.UiLis
                 }
                 final String toastMsg = msg;
                 final HmgapidClient.ConditioningStatus updated = HmgapidClient.queryConditioningStatus();
+                coordinator.getTelemetry().applyHmgVehicleSignals(updated.signals);
                 uiHandler.post(new Runnable() {
                     @Override
                     public void run() {
@@ -909,10 +911,10 @@ public final class MainActivity extends Activity implements BleCoordinator.UiLis
             @Override
             public void run() {
                 try {
-                    HmgapidClient.Reply r = HmgapidClient.startService("btprobe", 8000);
+                    HmgapidClient.Reply r = HmgapidClient.runBtProbe(6500);
                     DiagLogger.get().info("BTPROBE", "Exit=" + r.code + " (" + r.text.length() + " chars)");
                     String[] lines = r.text.split("[\\r\\n]+");
-                    for (int i = 0; i < lines.length && i < 40; i++) {
+                    for (int i = 0; i < lines.length && i < 80; i++) {
                         if (!lines[i].trim().isEmpty()) {
                             DiagLogger.get().info("BTPROBE", lines[i]);
                         }

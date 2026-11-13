@@ -719,9 +719,14 @@ public final class BleCoordinator {
                 String[] cellDids = (vehicleProfile == EgmpTelemetry.PROFILE_EGMP_144)
                         ? new String[] { "220102", "220103", "220104", "22010A", "22010B" }
                         : new String[] { "220102", "220103", "220104", "22010A", "22010B", "22010C" };
+                int okBlocks = 0;
                 for (int i = 0; i < cellDids.length && obdConnected && bridgeClientCount == 0; i++) {
-                    queryIsoTpAndApply(cellDids[i], 1400L);
+                    if (queryIsoTpAndApply(cellDids[i], 1400L)) {
+                        okBlocks++;
+                    }
                 }
+                DiagLogger.get().info("OBD", "Completed HV cell sweep (" + okBlocks + "/" + cellDids.length
+                        + " blocks, " + telemetry.snapshot().populatedCellCount + " cells)");
                 notifyUi();
             }
 
@@ -743,21 +748,27 @@ public final class BleCoordinator {
                 }
                 rateCommands += 2;
             } else {
-                // E-GMP Fast Cycle: BMS 220101 + ABS 220104
+                boolean medCycle = ((cycle % 3) == 0) && bridgeClientCount == 0;
+
+                // Keep 7E4/7EC selected across BMS fast (220101) + medium (220105, 220106) queries
                 currentCanHeader = switchTargetEcu(currentCanHeader, "7E4", "7EC");
                 gotData |= queryIsoTpAndApply("220101", 1300L);
                 rateCommands++;
-
-                currentCanHeader = switchTargetEcu(currentCanHeader, "7D1", "7D9");
-                gotData |= queryIsoTpAndApply("220104", 900L);
-                rateCommands++;
-
-                // E-GMP Medium Cycle: BMS 220105, 220106 + ICCU LDC 22E011 (or MY25 22E101)
-                if ((cycle % 3) == 0 && bridgeClientCount == 0) {
-                    currentCanHeader = switchTargetEcu(currentCanHeader, "7E4", "7EC");
+                if (medCycle) {
                     gotData |= queryIsoTpAndApply("220105", 1300L);
                     gotData |= queryIsoTpAndApply("220106", 1100L);
+                    rateCommands += 2;
+                }
 
+                // ABS/ESC 7D1 -> 7D9: Speed & Gear
+                if (bridgeClientCount == 0) {
+                    currentCanHeader = switchTargetEcu(currentCanHeader, "7D1", "7D9");
+                    gotData |= queryIsoTpAndApply("220104", 900L);
+                    rateCommands++;
+                }
+
+                // ICCU LDC 7E5 -> 7ED: 12V DC-DC + Aux 12V Sensor
+                if (medCycle && bridgeClientCount == 0) {
                     currentCanHeader = switchTargetEcu(currentCanHeader, "7E5", "7ED");
                     String iccuCmd = iccuUseMy25Did ? "22E101" : "22E011";
                     boolean iccuOk = queryIsoTpAndApply(iccuCmd, 1100L);
@@ -765,7 +776,7 @@ public final class BleCoordinator {
                         iccuUseMy25Did = !iccuUseMy25Did;
                     }
                     gotData |= iccuOk;
-                    rateCommands += 3;
+                    rateCommands++;
                 }
 
                 // E-GMP Slow Cycle: TPMS 22C00B + Cluster Odometer 22B002 + Adapter ATRV
@@ -798,6 +809,9 @@ public final class BleCoordinator {
                 sleepQuiet(60L);
             } else {
                 consecutiveNoData++;
+                if (consecutiveNoData == 4) {
+                    DiagLogger.get().warn("OBD", "4 consecutive empty cycles on " + obdMac + "; entering 5s standby");
+                }
                 if (consecutiveNoData >= 4) {
                     // Vehicle CAN is asleep (IG OFF) — back off to 5s standby so 12V battery rests
                     pollHz = 0.2f;
@@ -950,10 +964,26 @@ public final class BleCoordinator {
 
     private String pickNextCustomServiceOverride(List<String> svcs, Map<String, Integer> charPropsByUuid) {
         if (svcs == null || svcs.isEmpty()) return null;
-        // Never retry custom services if the device already identified as an LNEX BVM02 sensor (fff4 present)
+        // Never retry custom services if the device already identified as an LNEX BVM02 sensor
+        // (fff4 with NOTIFY/INDICATE and fff1 READ-only; ignore READ-only QN902x OTA fff4:02!)
         if (charPropsByUuid != null) {
-            for (String rawU : charPropsByUuid.keySet()) {
-                if ("fff4".equals(Elm327Protocol.normUuid(rawU))) {
+            int pFff1 = 0;
+            int pFff4 = 0;
+            boolean hasFff4 = false;
+            for (Map.Entry<String, Integer> e : charPropsByUuid.entrySet()) {
+                String n = Elm327Protocol.normUuid(e.getKey());
+                int p = (e.getValue() == null) ? 0 : e.getValue().intValue();
+                if ("fff1".equals(n)) {
+                    pFff1 = p;
+                } else if ("fff4".equals(n)) {
+                    hasFff4 = true;
+                    pFff4 = p;
+                }
+            }
+            if (hasFff4 && (pFff4 & (Elm327Protocol.PROP_NOTIFY | Elm327Protocol.PROP_INDICATE)) != 0) {
+                boolean fff1Active = (pFff1 & (Elm327Protocol.PROP_NOTIFY | Elm327Protocol.PROP_INDICATE
+                        | Elm327Protocol.PROP_WRITE | Elm327Protocol.PROP_WRITE_NO_RESP)) != 0;
+                if (!fff1Active) {
                     return null;
                 }
             }
@@ -966,7 +996,8 @@ public final class BleCoordinator {
                         || "1801".equals(s)
                         || "180a".equals(s)
                         || "180f".equals(s)
-                        || "1812".equals(s)) {
+                        || "1812".equals(s)
+                        || "0000d0ff-3c17-d293-8e48-14fe2e4da212".equals(s)) {
                     continue;
                 }
                 if (!triedServiceOverrides.contains(s)) {
@@ -1106,6 +1137,20 @@ public final class BleCoordinator {
 
                 List<Elm327Protocol.GattBinding> candidates = Elm327Protocol.resolveAdapterBindings(charPropsByUuid);
                 if (candidates.isEmpty()) {
+                    if (svcs.isEmpty() && (charPropsByUuid == null || charPropsByUuid.isEmpty())) {
+                        obdGattRejected = false;
+                        pendingTargetedSvcRetry = false;
+                        obdConnected = false;
+                        obdTimeoutStreak++;
+                        long retryMs = Math.min(12000L, 2500L * obdTimeoutStreak);
+                        nextObdReconnectMs = System.currentTimeMillis() + retryMs;
+                        obdStatusText = "Adapter booting (retrying)...";
+                        DiagLogger.get().warn("OBD", "Empty GATT table on " + upperMac
+                                + " (transient boot race; retrying in " + retryMs + " ms)");
+                        bleClient.disconnectDevice(upperMac);
+                        notifyUi();
+                        return;
+                    }
                     String nextSvc = pickNextCustomServiceOverride(svcs, charPropsByUuid);
                     if (nextSvc != null) {
                         obdServiceFilterOverride = nextSvc;
@@ -1196,12 +1241,26 @@ public final class BleCoordinator {
                     notifyUi();
                     return;
                 }
+                if ("EMPTY_GATT_TABLE".equals(reason)) {
+                    obdTimeoutStreak++;
+                    long retryMs = Math.min(12000L, 2500L * obdTimeoutStreak);
+                    nextObdReconnectMs = System.currentTimeMillis() + retryMs;
+                    obdStatusText = "Adapter booting (retrying)...";
+                    DiagLogger.get().warn("OBD", "OBD adapter GATT table empty while booting: "
+                            + upperMac + " (retrying in " + retryMs + " ms)");
+                    notifyUi();
+                    return;
+                }
                 if ("CONNECT_TIMEOUT".equals(reason)) {
                     obdTimeoutStreak++;
                     long backoffMs = Math.min(24000L, 6000L * obdTimeoutStreak);
                     nextObdReconnectMs = System.currentTimeMillis() + backoffMs;
                 }
-                obdStatusText = obdGattRejected ? "Incompatible GATT" : ("Disconnected (" + reason + ")");
+                if (obdGattRejected) {
+                    obdStatusText = "Incompatible GATT";
+                } else if (obdStatusText == null || !obdStatusText.startsWith("Adapter booting")) {
+                    obdStatusText = "Disconnected (" + reason + ")";
+                }
                 DiagLogger.get().warn("OBD", "OBD adapter disconnected: " + upperMac + " reason=" + reason);
                 notifyUi();
                 return;
@@ -1305,12 +1364,17 @@ public final class BleCoordinator {
                         Bvm02Protocol.DecodedFrame df = frames.get(i);
                         if (df.cmd == Bvm02Protocol.CMD_GET_HISTORY_V1 || df.cmd == Bvm02Protocol.CMD_GET_HISTORY_V2) {
                             // Extract 2-byte centivolt history samples into sparkline if present
+                            int extracted = 0;
                             for (int off = 6; off + 1 < df.payload.length; off += 2) {
                                 int cv = ((df.payload[off] & 0xFF) << 8) | (df.payload[off + 1] & 0xFF);
                                 if (cv >= 600 && cv <= 3200) {
                                     bvm.pushSample(cv / 100.0f);
+                                    extracted++;
                                 }
                             }
+                            DiagLogger.get().info("BVM02", "History sync frame received on Slot "
+                                    + (bvm.slot + 1) + " (" + upperMac + "): cmd=0x"
+                                    + Integer.toHexString(df.cmd) + " samples=" + extracted);
                             notifyUi();
                         }
                     }

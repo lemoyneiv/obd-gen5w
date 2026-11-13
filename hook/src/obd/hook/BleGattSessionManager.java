@@ -147,7 +147,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         volatile boolean active = true;
         volatile boolean multiConnMode = false;
         volatile boolean scanning = false;
-        volatile boolean cancelConnectRequested = false;
+        volatile boolean closingSession = false;
+        volatile String connectingMac = "";
+        volatile boolean cancelCurrentConnect = false;
         volatile int defaultServerMtu = DEFAULT_ATT_MTU;
         volatile String primaryMac = "";
         final Map<String, LeConnection> ownedByMac = new LinkedHashMap<String, LeConnection>();
@@ -184,8 +186,12 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         final Set<String> protectedWriteUuids = new HashSet<String>();
 
         volatile boolean closed = false;
+        volatile boolean closingRequested = false;
         volatile int attMtu = DEFAULT_ATT_MTU;
         volatile int preferredServerMtu = DEFAULT_ATT_MTU;
+
+        // Per-handle outbound LE ACL credit count (protected by hciLock)
+        int inflightAcl = 0;
 
         // Per-handle L2CAP reassembly state (protected by hciLock)
         ByteArrayOutputStream l2capReassembly = null;
@@ -249,7 +255,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     // Controller & shared LE ACL credit state
     private boolean controllerInitialized = false;
     private int controllerLeAclMaxLen = DEFAULT_LE_ACL_MAX_LEN;
-    private int maxLeAclCredits = 2;
+    private int maxLeAclCredits = 4;
     private int inflightLeAclPkts = 0;
     private volatile boolean hardwareScanning = false;
     private volatile boolean connectInProgress = false;
@@ -278,7 +284,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     first = false;
                     sb.append(c.mac)
                             .append("@0x").append(Integer.toHexString(c.handle))
-                            .append("(mtu=").append(c.attMtu).append(')');
+                            .append("(mtu=").append(c.attMtu)
+                            .append(",acl=").append(c.inflightAcl).append(')');
                 }
                 sb.append(']');
             }
@@ -290,7 +297,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         List<ClientSession> snapshot = new ArrayList<ClientSession>(activeSessions);
         for (int i = 0; i < snapshot.size(); i++) {
             ClientSession s = snapshot.get(i);
-            s.cancelConnectRequested = true;
+            s.closingSession = true;
+            s.cancelCurrentConnect = true;
             s.scanning = false;
         }
         synchronized (hciLock) {
@@ -388,20 +396,17 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 String trimmed = raw.trim();
                 if (trimmed.isEmpty()) continue;
                 if ("QUIT".equals(trimmed)) {
-                    session.cancelConnectRequested = true;
+                    session.closingSession = true;
+                    session.cancelCurrentConnect = true;
                     synchronized (hciLock) {
                         hciLock.notifyAll();
                     }
                     wakeAllSessionAttLocks(session);
                     break;
                 }
-                if (trimmed.equals("DISCONNECT") || trimmed.endsWith(" DISCONNECT")
-                        || trimmed.startsWith("DISCONNECT ")) {
-                    session.cancelConnectRequested = true;
-                    synchronized (hciLock) {
-                        hciLock.notifyAll();
-                    }
-                    wakeAllSessionAttLocks(session);
+                String discTarget = extractDisconnectTarget(trimmed);
+                if (discTarget != null) {
+                    signalDisconnectPreempt(session, discTarget);
                 }
                 synchronized (queueLock) {
                     if (cmdQueue.size() < 128) {
@@ -412,7 +417,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             }
         } catch (Throwable ignored) {
         } finally {
-            session.cancelConnectRequested = true;
+            session.closingSession = true;
+            session.cancelCurrentConnect = true;
             synchronized (hciLock) {
                 hciLock.notifyAll();
             }
@@ -611,6 +617,64 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
     // ================= SESSION & CONNECTION LIFECYCLE =================
 
+    private static String extractDisconnectTarget(String trimmed) {
+        if ("DISCONNECT".equals(trimmed)) {
+            return "";
+        }
+        if (trimmed.startsWith("DISCONNECT ")) {
+            return trimmed.substring("DISCONNECT ".length()).trim().toUpperCase(Locale.US);
+        }
+        if (trimmed.startsWith("@")) {
+            int sp = trimmed.indexOf(' ');
+            if (sp > 1) {
+                String mac = trimmed.substring(1, sp).trim().toUpperCase(Locale.US);
+                String rest = trimmed.substring(sp + 1).trim();
+                if ("DISCONNECT".equals(rest)) {
+                    return mac;
+                }
+            }
+        }
+        return null;
+    }
+
+    private void signalDisconnectPreempt(ClientSession session, String target) {
+        boolean allLinks = "ALL".equals(target) || "*".equals(target)
+                || (target.isEmpty() && !session.multiConnMode);
+        if (allLinks) {
+            session.cancelCurrentConnect = true;
+            List<LeConnection> list;
+            synchronized (session.ownedByMac) {
+                list = new ArrayList<LeConnection>(session.ownedByMac.values());
+            }
+            for (int i = 0; i < list.size(); i++) {
+                list.get(i).closingRequested = true;
+            }
+            synchronized (hciLock) {
+                hciLock.notifyAll();
+            }
+            wakeAllSessionAttLocks(session);
+            return;
+        }
+
+        String mac = target.isEmpty() ? session.primaryMac : target;
+        if (mac != null && !mac.isEmpty() && mac.equalsIgnoreCase(session.connectingMac)) {
+            session.cancelCurrentConnect = true;
+            synchronized (hciLock) {
+                hciLock.notifyAll();
+            }
+        }
+        LeConnection conn;
+        synchronized (session.ownedByMac) {
+            conn = (mac == null || mac.isEmpty()) ? null : session.ownedByMac.get(mac);
+        }
+        if (conn != null) {
+            conn.closingRequested = true;
+            synchronized (conn.attLock) {
+                conn.attLock.notifyAll();
+            }
+        }
+    }
+
     private void wakeAllSessionAttLocks(ClientSession session) {
         List<LeConnection> list;
         synchronized (session.ownedByMac) {
@@ -618,6 +682,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
         for (int i = 0; i < list.size(); i++) {
             LeConnection c = list.get(i);
+            c.closingRequested = true;
             synchronized (c.attLock) {
                 c.attLock.notifyAll();
             }
@@ -628,7 +693,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         if (session == null) return;
         session.active = false;
         session.scanning = false;
-        session.cancelConnectRequested = true;
+        session.closingSession = true;
+        session.cancelCurrentConnect = true;
         activeSessions.remove(session);
 
         syncHardwareScanState(null);
@@ -712,9 +778,10 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             int leNumPkts = bufRsp[8] & 0xFF;
             controllerLeAclMaxLen = (lePktLen >= DEFAULT_LE_ACL_MAX_LEN) ? lePktLen : DEFAULT_LE_ACL_MAX_LEN;
             if (leNumPkts > 0) {
-                maxLeAclCredits = Math.min(leNumPkts, 4);
+                maxLeAclCredits = Math.min(leNumPkts, 6);
             } else {
-                maxLeAclCredits = 2; // Shared BR/EDR ACL pool: cap conservatively to protect A2DP
+                // Broadcom shared BR/EDR+LE ACL pool: 4 credits supports multi-link BLE while protecting A2DP
+                maxLeAclCredits = 4;
             }
             if (mod != null) {
                 mod.log("Controller LE ready: leAclLen=" + controllerLeAclMaxLen + " (raw=" + lePktLen
@@ -876,7 +943,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             }
         }
 
-        session.cancelConnectRequested = false;
+        session.connectingMac = mac;
+        session.cancelCurrentConnect = false;
         session.emitForConn(mac, "CONN_STATE CONNECTING " + mac);
 
         LeConnection established = null;
@@ -894,7 +962,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 byte[] connEvt = null;
                 int lastStatus = -1;
                 for (int attempt = 0; attempt < candidateAddrTypes.length; attempt++) {
-                    if (session.cancelConnectRequested || !session.active) {
+                    if (session.closingSession || session.cancelCurrentConnect || !session.active) {
                         session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=0 reason=CANCELED");
                         return;
                     }
@@ -917,7 +985,10 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
                     long deadline = System.currentTimeMillis() + waitMs;
                     synchronized (hciLock) {
-                        while (pendingLeConnEvent == null && !session.cancelConnectRequested && session.active) {
+                        while (pendingLeConnEvent == null
+                                && !session.closingSession
+                                && !session.cancelCurrentConnect
+                                && session.active) {
                             long rem = deadline - System.currentTimeMillis();
                             if (rem <= 0L) break;
                             try {
@@ -955,7 +1026,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     }
                 }
 
-                if (session.cancelConnectRequested || !session.active) {
+                if (session.closingSession || session.cancelCurrentConnect || !session.active) {
                     if (connEvt != null && (connEvt[3] & 0xFF) == 0) {
                         int h = u16le(connEvt, 4) & 0x0FFF;
                         sendDisconnectCmd(h);
@@ -994,18 +1065,21 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 session.emitForConn(mac, String.format(Locale.US, "CONN_STATE DISCOVERING %s handle=0x%04x",
                         mac, Integer.valueOf(handle)));
             } finally {
+                if (mac.equals(session.connectingMac)) {
+                    session.connectingMac = "";
+                }
                 connectInProgress = false;
                 syncHardwareScanState(mod);
             }
         }
 
-        if (established == null || established.closed) {
+        if (established == null || established.closed || established.closingRequested) {
             return;
         }
 
-        // Brief settle window before ATT service discovery (matches KitKat Broadcom peripheral timing)
-        sleepQuietly(150L);
-        if (established.closed) {
+        // Brief settle window before ATT service discovery (dual-mode BLE OBD MCU GATT init window)
+        sleepQuietly(220L);
+        if (established.closed || established.closingRequested) {
             return;
         }
 
@@ -1036,20 +1110,20 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
     private void disconnectConnection(LeConnection conn, boolean emitEvent, String reason) {
         if (conn == null) return;
+        conn.closingRequested = true;
         boolean wasOpen = false;
         synchronized (hciLock) {
             if (!conn.closed) {
                 conn.closed = true;
                 wasOpen = true;
+                conn.inflightAcl = 0;
                 connectionsByHandle.remove(Integer.valueOf(conn.handle));
                 if (connectionsByMac.get(conn.mac) == conn) {
                     connectionsByMac.remove(conn.mac);
                 }
                 conn.l2capReassembly = null;
                 conn.l2capExpectedLen = 0;
-                if (connectionsByHandle.isEmpty()) {
-                    inflightLeAclPkts = 0;
-                }
+                recomputeInflightAclLocked();
                 hciLock.notifyAll();
             }
         }
@@ -1101,54 +1175,66 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         int targetSvcEnd = 0;
         List<DiscoveredService> services = new ArrayList<DiscoveredService>();
 
-        // 1. Discover Primary Services (UUID 0x2800) via ATT_READ_BY_GROUP_TYPE_REQ (0x10)
-        int curStart = 0x0001;
-        int guard = 0;
-        while (curStart <= 0xFFFF && guard++ < 48) {
-            byte[] req = new byte[]{
-                    (byte) ATT_READ_BY_GROUP_TYPE_REQ,
-                    (byte) (curStart & 0xFF), (byte) ((curStart >> 8) & 0xFF),
-                    (byte) 0xFF, (byte) 0xFF,
-                    0x00, 0x28
-            };
-            byte[] rsp = transactAtt(conn, req, 3000L);
-            if (rsp == null) {
-                disconnectConnection(conn, true, "ATT_SVC_DISCOVERY_TIMEOUT");
-                return false;
+        // 1. Discover Primary Services (UUID 0x2800) via ATT_READ_BY_GROUP_TYPE_REQ (0x10),
+        //    retrying up to 2 times if a dual-mode BLE MCU rejects the first post-boot query.
+        for (int svcAttempt = 0; svcAttempt < 3; svcAttempt++) {
+            if (svcAttempt > 0) {
+                if (conn.closed || conn.closingRequested || conn.owner.closingSession || !conn.owner.active) {
+                    break;
+                }
+                sleepQuietly(350L);
             }
-            int op = rsp[0] & 0xFF;
-            if (op == ATT_ERROR_RSP) {
-                break; // 0x0A Attribute Not Found -> end of primary services
+            int curStart = 0x0001;
+            int guard = 0;
+            while (curStart <= 0xFFFF && guard++ < 48) {
+                byte[] req = new byte[]{
+                        (byte) ATT_READ_BY_GROUP_TYPE_REQ,
+                        (byte) (curStart & 0xFF), (byte) ((curStart >> 8) & 0xFF),
+                        (byte) 0xFF, (byte) 0xFF,
+                        0x00, 0x28
+                };
+                byte[] rsp = transactAtt(conn, req, 3000L);
+                if (rsp == null) {
+                    disconnectConnection(conn, true, "ATT_SVC_DISCOVERY_TIMEOUT");
+                    return false;
+                }
+                int op = rsp[0] & 0xFF;
+                if (op == ATT_ERROR_RSP) {
+                    break; // 0x0A Attribute Not Found -> end of primary services
+                }
+                if (op != ATT_READ_BY_GROUP_TYPE_RSP || rsp.length < 4) {
+                    break;
+                }
+                int itemLen = rsp[1] & 0xFF;
+                if (itemLen != 6 && itemLen != 20) {
+                    break;
+                }
+                int lastEnd = curStart;
+                for (int pos = 2; pos + itemLen <= rsp.length; pos += itemLen) {
+                    int sHandle = u16le(rsp, pos);
+                    int eHandle = u16le(rsp, pos + 2);
+                    String svcUuid = decodeAttUuid(rsp, pos + 4, itemLen - 4);
+                    if (sHandle > 0 && eHandle >= sHandle) {
+                        services.add(new DiscoveredService(svcUuid, sHandle, eHandle));
+                    }
+                    conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_SVC %s %04x %04x",
+                            svcUuid, Integer.valueOf(sHandle), Integer.valueOf(eHandle)));
+                    if (!wildcard && serviceFilter.equals(svcUuid)) {
+                        targetSvcStart = sHandle;
+                        targetSvcEnd = eHandle;
+                    }
+                    if (eHandle > lastEnd) {
+                        lastEnd = eHandle;
+                    }
+                }
+                if (lastEnd >= 0xFFFF || lastEnd < curStart) {
+                    break;
+                }
+                curStart = lastEnd + 1;
             }
-            if (op != ATT_READ_BY_GROUP_TYPE_RSP || rsp.length < 4) {
+            if (!services.isEmpty()) {
                 break;
             }
-            int itemLen = rsp[1] & 0xFF;
-            if (itemLen != 6 && itemLen != 20) {
-                break;
-            }
-            int lastEnd = curStart;
-            for (int pos = 2; pos + itemLen <= rsp.length; pos += itemLen) {
-                int sHandle = u16le(rsp, pos);
-                int eHandle = u16le(rsp, pos + 2);
-                String svcUuid = decodeAttUuid(rsp, pos + 4, itemLen - 4);
-                if (sHandle > 0 && eHandle >= sHandle) {
-                    services.add(new DiscoveredService(svcUuid, sHandle, eHandle));
-                }
-                conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_SVC %s %04x %04x",
-                        svcUuid, Integer.valueOf(sHandle), Integer.valueOf(eHandle)));
-                if (!wildcard && serviceFilter.equals(svcUuid)) {
-                    targetSvcStart = sHandle;
-                    targetSvcEnd = eHandle;
-                }
-                if (eHandle > lastEnd) {
-                    lastEnd = eHandle;
-                }
-            }
-            if (lastEnd >= 0xFFFF || lastEnd < curStart) {
-                break;
-            }
-            curStart = lastEnd + 1;
         }
 
         // 2. Build per-service handle ranges (matching Bluedroid / CoreBluetooth per-service discovery
@@ -1173,8 +1259,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             int rangeEnd = svcRange.endHandle;
             List<DiscoveredChar> svcChars = new ArrayList<DiscoveredChar>();
 
-            curStart = rangeStart;
-            guard = 0;
+            int curStart = rangeStart;
+            int guard = 0;
             while (curStart <= rangeEnd && guard++ < 64) {
                 byte[] req = new byte[]{
                         (byte) ATT_READ_BY_TYPE_REQ,
@@ -1235,8 +1321,10 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
 
         boolean serviceSatisfied;
+        boolean emptyTable;
         StringBuilder specCsv = new StringBuilder();
         synchronized (conn.attLock) {
+            emptyTable = conn.charByUuid.isEmpty();
             if (wildcard) {
                 serviceSatisfied = true;
             } else if ("fff0".equals(serviceFilter)) {
@@ -1263,8 +1351,12 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             return false;
         }
 
-        conn.owner.emitForConn(conn.mac,
-                "GATT_READY " + conn.mac + " " + (specCsv.length() > 0 ? specCsv.toString() : "none"));
+        if (emptyTable) {
+            disconnectConnection(conn, true, "EMPTY_GATT_TABLE");
+            return false;
+        }
+
+        conn.owner.emitForConn(conn.mac, "GATT_READY " + conn.mac + " " + specCsv.toString());
         return true;
     }
 
@@ -1693,9 +1785,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     }
 
     private byte[] transactAtt(LeConnection conn, byte[] attReq, long timeoutMs) {
-        if (conn == null || conn.closed) return null;
+        if (conn == null || conn.closed || conn.closingRequested) return null;
         synchronized (conn.attLock) {
-            if (conn.closed) return null;
+            if (conn.closed || conn.closingRequested) return null;
             conn.pendingAttResponse = null;
             conn.attAwaitingResponse = true;
         }
@@ -1710,7 +1802,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             try {
                 while (conn.pendingAttResponse == null
                         && !conn.closed
-                        && !conn.owner.cancelConnectRequested
+                        && !conn.closingRequested
+                        && !conn.owner.closingSession
                         && conn.owner.active) {
                     long rem = deadline - System.currentTimeMillis();
                     if (rem <= 0L) break;
@@ -1727,6 +1820,36 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     }
 
     // ================= HCI & L2CAP PACKET FRAMING / FRAGMENTATION / DISPATCH =================
+
+    private void recomputeInflightAclLocked() {
+        int sum = 0;
+        for (LeConnection c : connectionsByHandle.values()) {
+            if (!c.closed && c.inflightAcl > 0) {
+                sum += c.inflightAcl;
+            }
+        }
+        inflightLeAclPkts = sum;
+    }
+
+    private boolean reclaimStaleAclCreditLocked(LeConnection requester) {
+        LeConnection busiest = null;
+        for (LeConnection c : connectionsByHandle.values()) {
+            if (!c.closed && c.inflightAcl > 0
+                    && (busiest == null || c.inflightAcl > busiest.inflightAcl)) {
+                busiest = c;
+            }
+        }
+        if (busiest != null) {
+            busiest.inflightAcl--;
+            recomputeInflightAclLocked();
+            return true;
+        }
+        if (inflightLeAclPkts > 0) {
+            inflightLeAclPkts = 0;
+            return true;
+        }
+        return requester != null && !requester.closed;
+    }
 
     private byte[] sendHciCmdSync(int opcode, byte[] params, long timeoutMs) {
         byte[] pkt = buildHciCommandPacket(opcode, params);
@@ -1802,7 +1925,17 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 while (connectionsByHandle.containsKey(Integer.valueOf(handle))
                         && inflightLeAclPkts >= maxLeAclCredits) {
                     long rem = deadline - System.currentTimeMillis();
-                    if (rem <= 0L) return false;
+                    if (rem <= 0L) {
+                        LeConnection target = connectionsByHandle.get(Integer.valueOf(handle));
+                        if (target == null || target.closed || target.closingRequested) {
+                            return false;
+                        }
+                        if (!reclaimStaleAclCreditLocked(target)) {
+                            return false;
+                        }
+                        deadline = System.currentTimeMillis() + 250L;
+                        break;
+                    }
                     try {
                         hciLock.wait(rem);
                     } catch (InterruptedException ie) {
@@ -1810,16 +1943,21 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     }
                 }
                 LeConnection conn = connectionsByHandle.get(Integer.valueOf(handle));
-                if (conn == null || conn.closed) {
+                if (conn == null || conn.closed || conn.closingRequested) {
                     return false;
                 }
-                inflightLeAclPkts++;
+                conn.inflightAcl++;
+                recomputeInflightAclLocked();
             }
 
             boolean ok = transport.sendLeAcl(fragments.get(i));
             if (!ok) {
                 synchronized (hciLock) {
-                    if (inflightLeAclPkts > 0) inflightLeAclPkts--;
+                    LeConnection conn = connectionsByHandle.get(Integer.valueOf(handle));
+                    if (conn != null && conn.inflightAcl > 0) {
+                        conn.inflightAcl--;
+                    }
+                    recomputeInflightAclLocked();
                     hciLock.notifyAll();
                 }
                 return false;
@@ -1867,12 +2005,14 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     for (int i = 0; i < numH; i++) {
                         int h = u16le(ev, 3 + i * 4) & 0x0FFF;
                         int completed = u16le(ev, 5 + i * 4);
-                        if (completed > 0 && connectionsByHandle.containsKey(Integer.valueOf(h))) {
-                            inflightLeAclPkts = Math.max(0, inflightLeAclPkts - completed);
+                        LeConnection c = connectionsByHandle.get(Integer.valueOf(h));
+                        if (completed > 0 && c != null) {
+                            c.inflightAcl = Math.max(0, c.inflightAcl - completed);
                             changed = true;
                         }
                     }
                     if (changed) {
+                        recomputeInflightAclLocked();
                         hciLock.notifyAll();
                     }
                 }
@@ -1891,14 +2031,14 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     dropped = connectionsByHandle.remove(Integer.valueOf(h));
                     if (dropped != null) {
                         dropped.closed = true;
+                        dropped.closingRequested = true;
+                        dropped.inflightAcl = 0;
                         if (connectionsByMac.get(dropped.mac) == dropped) {
                             connectionsByMac.remove(dropped.mac);
                         }
                         dropped.l2capReassembly = null;
                         dropped.l2capExpectedLen = 0;
-                        if (connectionsByHandle.isEmpty()) {
-                            inflightLeAclPkts = 0;
-                        }
+                        recomputeInflightAclLocked();
                         hciLock.notifyAll();
                     }
                 }
