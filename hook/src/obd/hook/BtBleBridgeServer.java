@@ -1,0 +1,253 @@
+package obd.hook;
+
+import android.net.Credentials;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.Charset;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import hmgapi.hook.LoadedApp;
+import hmgapi.hook.ModContext;
+
+/**
+ * Lightweight, zero-disk-I/O abstract UNIX domain socket server ({@code @gen5w_ble}
+ * and backwards-compatible {@code @bvm02_ble}) running strictly inside {@code com.android.bluetooth}.
+ *
+ * Coexistence-safe across multiple installed BLE mods: if another mod (such as {@code bvm02-gen5w})
+ * is already serving {@code @gen5w_ble}, this server yields cleanly without double-hooking
+ * {@code bplus.default.so}.
+ */
+public final class BtBleBridgeServer {
+
+    public static final String GEN5W_SOCKET_NAME = "gen5w_ble";
+    public static final String SOCKET_NAME = "bvm02_ble";
+    private static final Charset UTF8 = Charset.forName("UTF-8");
+    private static final AtomicBoolean BVM02_STARTED = new AtomicBoolean(false);
+    private static final AtomicBoolean GEN5W_STARTED = new AtomicBoolean(false);
+    private static volatile boolean modEnabled = true;
+    private static volatile LoadedApp lastApp;
+    private static volatile LocalServerSocket gen5wServer;
+    private static volatile LocalServerSocket bvm02Server;
+
+    private BtBleBridgeServer() {}
+
+    public static void setModEnabled(ModContext mod, boolean enabled) {
+        modEnabled = enabled;
+        if (!enabled) {
+            BleGattSessionManager.getInstance().onModDisabled();
+            BtNativeBridge.shutdown();
+            closeQuietly(gen5wServer);
+            closeQuietly(bvm02Server);
+            gen5wServer = null;
+            bvm02Server = null;
+        } else if (lastApp != null) {
+            startIfNeeded(mod, lastApp);
+        }
+    }
+
+    public static void startIfNeeded(final ModContext mod, final LoadedApp app) {
+        lastApp = app;
+        modEnabled = (mod == null) || mod.enabled();
+        if (!modEnabled) {
+            return;
+        }
+        if (!GEN5W_STARTED.get() && isPeerBridgeAlive(GEN5W_SOCKET_NAME)) {
+            if (mod != null) {
+                mod.log("BtBleBridgeServer: peer @" + GEN5W_SOCKET_NAME
+                        + " already active in com.android.bluetooth; sharing existing BLE session server.");
+            }
+            return;
+        }
+        startEndpointIfNeeded(mod, app, GEN5W_SOCKET_NAME, true, GEN5W_STARTED, "ObdGen5wBleBridge");
+        startEndpointIfNeeded(mod, app, SOCKET_NAME, false, BVM02_STARTED, "ObdBvm02BleBridge");
+    }
+
+    private static boolean isPeerBridgeAlive(String socketName) {
+        LocalSocket probe = null;
+        try {
+            probe = new LocalSocket();
+            probe.connect(new LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT));
+            probe.setSoTimeout(800);
+            OutputStream out = probe.getOutputStream();
+            out.write("PING\n".getBytes(UTF8));
+            out.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(probe.getInputStream(), UTF8));
+            String line = br.readLine();
+            return line != null && line.startsWith("OK PONG");
+        } catch (Throwable ignored) {
+            return false;
+        } finally {
+            if (probe != null) {
+                try { probe.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private static void closeQuietly(LocalServerSocket s) {
+        if (s != null) {
+            try { s.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void startEndpointIfNeeded(
+            final ModContext mod,
+            final LoadedApp app,
+            final String socketName,
+            final boolean genericDefault,
+            final AtomicBoolean startedGuard,
+            final String threadName) {
+        if (!startedGuard.compareAndSet(false, true)) {
+            return;
+        }
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                runAcceptLoop(mod, app, socketName, genericDefault, startedGuard);
+            }
+        }, threadName);
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        t.start();
+    }
+
+    private static void runAcceptLoop(
+            final ModContext mod,
+            final LoadedApp app,
+            final String socketName,
+            final boolean genericDefault,
+            final AtomicBoolean startedGuard) {
+        LocalServerSocket server = null;
+        try {
+            server = new LocalServerSocket(socketName);
+            if (genericDefault) {
+                gen5wServer = server;
+            } else {
+                bvm02Server = server;
+            }
+            if (mod != null) {
+                mod.log("BtBleBridgeServer v" + BtHookEntry.HOOK_VERSION + " listening on abstract @" + socketName
+                        + " (genericDefault=" + genericDefault + ") in "
+                        + (app != null ? app.processName : "com.android.bluetooth"));
+            }
+            while (modEnabled) {
+                final LocalSocket client = server.accept();
+                if (client == null) continue;
+                Thread clientThread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            handleClient(mod, app, client, genericDefault);
+                        } catch (Throwable clientErr) {
+                            if (mod != null) {
+                                mod.log("BtBleBridgeServer client err (@" + socketName + "): " + clientErr);
+                            }
+                        } finally {
+                            try { client.close(); } catch (Throwable ignored) {}
+                        }
+                    }
+                }, "BleClient-" + socketName);
+                clientThread.setDaemon(true);
+                clientThread.start();
+            }
+        } catch (Throwable bindErr) {
+            if (mod != null && modEnabled) {
+                mod.log("BtBleBridgeServer @" + socketName + " stopped/shared: " + bindErr.getMessage());
+            }
+        } finally {
+            startedGuard.set(false);
+            closeQuietly(server);
+        }
+    }
+
+    private static void handleClient(
+            ModContext mod,
+            LoadedApp app,
+            LocalSocket client,
+            boolean genericDefault) throws Exception {
+        client.setSoTimeout(2500);
+        Credentials creds = client.getPeerCredentials();
+        int uid = (creds != null) ? creds.getUid() : -1;
+        if (uid < 0 || (uid != 0 && uid != 1000 && uid != 1002 && uid < 10000)) {
+            return;
+        }
+
+        BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream(), UTF8));
+        OutputStream os = client.getOutputStream();
+        String cmd = reader.readLine();
+        if (cmd == null) {
+            return;
+        }
+        cmd = cmd.trim();
+        boolean isEnabled = modEnabled && (mod == null || mod.enabled());
+
+        if ("STREAM_SESSION".equals(cmd) || "STREAM_SESSION GENERIC".equals(cmd) || "STREAM_SESSION BVM02".equals(cmd)) {
+            if (!isEnabled) {
+                os.write("ERR MOD_DISABLED\n".getBytes(UTF8));
+                os.flush();
+                return;
+            }
+            if (!BtNativeBridge.ensureInitialized(mod, app)) {
+                String status = BtNativeBridge.describeStatus(mod, app);
+                os.write(("ERR BRIDGE_INIT_FAILED " + status + "\n").getBytes(UTF8));
+                os.flush();
+                return;
+            }
+            boolean sessionGeneric = genericDefault;
+            if ("STREAM_SESSION GENERIC".equals(cmd)) {
+                sessionGeneric = true;
+            } else if ("STREAM_SESSION BVM02".equals(cmd)) {
+                sessionGeneric = false;
+            }
+            client.setSoTimeout(0);
+            BleGattSessionManager.getInstance().runStreamSession(mod, reader, os, sessionGeneric);
+            return;
+        }
+
+        StringBuilder resp = new StringBuilder(512);
+        if ("PING".equals(cmd)) {
+            resp.append("OK PONG version=")
+                    .append(BtHookEntry.HOOK_VERSION)
+                    .append(" pid=")
+                    .append(android.os.Process.myPid())
+                    .append(" uid=")
+                    .append(android.os.Process.myUid())
+                    .append(" enabled=")
+                    .append(isEnabled)
+                    .append('\n');
+        } else if ("BRIDGE_STATUS".equals(cmd)) {
+            if (!isEnabled) {
+                resp.append("BRIDGE: status=MOD_DISABLED\n");
+            } else {
+                resp.append("BRIDGE: ").append(BtNativeBridge.describeStatus(mod, app)).append('\n');
+            }
+        } else if ("SESSIONS".equals(cmd)) {
+            if (!isEnabled) {
+                resp.append("SESSIONS: status=MOD_DISABLED\n");
+            } else {
+                resp.append("SESSIONS: ").append(BleGattSessionManager.getInstance().describeActiveSessions()).append('\n');
+            }
+        } else if ("CAPS".equals(cmd)) {
+            if (!isEnabled) {
+                resp.append("CAPS: status=MOD_DISABLED\n");
+            } else {
+                List<String> lines = BtMemInspector.inspectLiveCapabilities(mod);
+                for (int i = 0; i < lines.size(); i++) {
+                    resp.append("CAPS: ").append(lines.get(i)).append('\n');
+                }
+                resp.append("CAPS: jni_bridge=").append(BtNativeBridge.describeStatus(mod, app)).append('\n');
+                resp.append("CAPS: sessions=").append(BleGattSessionManager.getInstance().describeActiveSessions()).append('\n');
+            }
+        } else {
+            resp.append("ERR UNKNOWN_CMD\n");
+        }
+        resp.append("END\n");
+        os.write(resp.toString().getBytes(UTF8));
+        os.flush();
+    }
+}

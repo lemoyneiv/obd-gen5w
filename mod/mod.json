@@ -1,0 +1,69 @@
+{
+  "id": "obd-gen5w",
+  "name": "OBD-II & E-GMP Telemetry",
+  "version": "0.1.0",
+  "hmgapi": ">=1.0.0",
+  "authors": ["lemoyneiv"],
+  "license": "AGPL-3.0",
+  "description": "Native BLE OBD-II & Hyundai/Kia E-GMP EV telemetry dashboard (HV pack kW/V/A, 192-cell balance, SOH, ICCU LDC 12V health, TPMS, preconditioning, DTC reader), localhost Wi-Fi ELM327 bridge (127.0.0.1:35000), and optional concurrent BVM02 12V battery monitor.",
+  "live": true,
+  "hooks": {
+    "jar": "hooks.jar",
+    "entry": "obd.hook.BtHookEntry"
+  },
+  "apps": [
+    { "package": "obd.app", "apk": "app/ObdTelemetry.apk" }
+  ],
+  "vehicle": {
+    "read": [
+      "gear.park",
+      "hv.ready",
+      "hv.conditioning",
+      "hv.conditioning_active",
+      "hv.battery_temp_min",
+      "conditioning.state"
+    ],
+    "commands": [
+      "conditioning"
+    ]
+  },
+  "services": [
+    {
+      "name": "reboot",
+      "script": "svc/reboot.sh",
+      "user": "root",
+      "start": "manual",
+      "restart": false
+    },
+    {
+      "name": "screenshot",
+      "script": "svc/screenshot.sh",
+      "user": "root",
+      "start": "manual",
+      "restart": false
+    },
+    {
+      "name": "btprobe",
+      "script": "svc/btprobe.sh",
+      "user": "root",
+      "start": "manual",
+      "restart": false
+    }
+  ],
+  "usb": [
+    "OBDLogs"
+  ],
+  "provides": {
+    "launcher": [
+      {
+        "title": "OBD-II",
+        "package": "obd.app",
+        "class": ".MainActivity",
+        "icon": "icons/tile.png",
+        "icon_night": "icons/tile.png",
+        "icon_disabled": "icons/tile_disabled.png",
+        "icon_disabled_night": "icons/tile_disabled.png"
+      }
+    ]
+  }
+}
