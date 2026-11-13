@@ -533,12 +533,65 @@ public final class ObdUnitTests {
         // Pure unit tests for L2CAP 0x12 Connection Parameter Update Request policy
         check(BleGattSessionManager.shouldAcceptConnParamUpdate(24, 40, 0, 400),
                 "Fast 30..50ms lat=0 timeout=4.0s conn param update must be accepted");
+        check(BleGattSessionManager.shouldAcceptConnParamUpdate(16, 32, 20, 500),
+                "Veepeak RTL8762 (min=16, max=32, lat=20, timeout=500) conn param update must be ACCEPTED (Central clamps lat=0)");
+        check(!BleGattSessionManager.shouldAcceptConnParamUpdate(8, 8, 99, 400),
+                "BVM02 ultra-tight 10ms (min=8, max=8, lat=99) conn param update must be REJECTED");
         check(!BleGattSessionManager.shouldAcceptConnParamUpdate(160, 320, 0, 400),
                 "Slow 200..400ms power-saving QN902x conn param update must be REJECTED");
-        check(!BleGattSessionManager.shouldAcceptConnParamUpdate(24, 40, 4, 400),
-                "High slave latency (lat=4) conn param update must be REJECTED");
         check(!BleGattSessionManager.shouldAcceptConnParamUpdate(24, 40, 0, 50),
                 "Short supervision timeout (<1.0s) conn param update must be REJECTED");
+
+        // Pure unit tests for Local GAP/GATT Server (preventing 30.0s peripheral ATT Transaction Timeout)
+        byte[] grpRsp = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x10, 0x01, 0x00, (byte) 0xFF, (byte) 0xFF, 0x00, 0x28 });
+        check(grpRsp != null && grpRsp.length == 14 && (grpRsp[0] & 0xFF) == 0x11
+                && (grpRsp[6] & 0xFF) == 0x00 && (grpRsp[7] & 0xFF) == 0x18
+                && (grpRsp[12] & 0xFF) == 0x01 && (grpRsp[13] & 0xFF) == 0x18,
+                "Local GATT server 0x10 Read_By_Group_Type_Req must expose 0x1800 (1..5) and 0x1801 (6..9)");
+        byte[] grpEnd = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x10, 0x0A, 0x00, (byte) 0xFF, (byte) 0xFF, 0x00, 0x28 });
+        check(grpEnd != null && grpEnd.length == 5 && grpEnd[0] == 0x01 && grpEnd[1] == 0x10 && grpEnd[4] == 0x0A,
+                "Local GATT server 0x10 past handle 0x0009 must return ATT_ERROR_RSP 0x0A Attribute Not Found");
+
+        byte[] findGap = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x06, 0x01, 0x00, (byte) 0xFF, (byte) 0xFF, 0x00, 0x28, 0x00, 0x18 });
+        check(findGap != null && findGap.length == 5 && findGap[0] == 0x07 && findGap[1] == 0x01 && findGap[3] == 0x05,
+                "Local GATT server 0x06 Find_By_Type_Value_Req for 0x1800 must return handles 0x0001..0x0005");
+
+        byte[] findAncs = new byte[] {
+                0x06, 0x01, 0x00, (byte) 0xFF, (byte) 0xFF, 0x00, 0x28,
+                (byte) 0xD0, 0x00, 0x2D, 0x12, 0x1E, 0x4B, 0x0F, (byte) 0xA4,
+                (byte) 0x99, 0x4E, (byte) 0xCE, (byte) 0xB5, 0x31, (byte) 0xF4, 0x05, 0x79
+        };
+        byte[] ancsErr = BleGattSessionManager.buildLocalGattServerResponse(findAncs);
+        check(ancsErr != null && ancsErr.length == 5 && ancsErr[0] == 0x01 && ancsErr[1] == 0x06 && ancsErr[4] == 0x0A,
+                "Realtek ANCS 0x06 Find_By_Type_Value_Req must immediately return ATT_ERROR_RSP 0x0A");
+
+        byte[] devNameByType = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x08, 0x01, 0x00, (byte) 0xFF, (byte) 0xFF, 0x00, 0x2A });
+        check(devNameByType != null && devNameByType.length == 9 && devNameByType[0] == 0x09
+                && "Gen5W".equals(new String(devNameByType, 4, 5, UTF8)),
+                "Local GATT server 0x08 Read_By_Type_Req for 0x2A00 must return 'Gen5W'");
+
+        byte[] charDecls = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x08, 0x01, 0x00, 0x09, 0x00, 0x03, 0x28 });
+        check(charDecls != null && charDecls.length == 23 && charDecls[0] == 0x09 && charDecls[1] == 0x07,
+                "Local GATT server 0x08 Read_By_Type_Req for 0x2803 must fit all 3 char decls in 23-byte ATT_MTU");
+
+        byte[] cccdWriteRsp = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x12, 0x09, 0x00, 0x02, 0x00 });
+        check(cccdWriteRsp != null && cccdWriteRsp.length == 1 && cccdWriteRsp[0] == 0x13,
+                "Local GATT server 0x12 Write_Req on 0x2A05 CCCD (handle 0x0009) must return 0x13 ATT_WRITE_RSP");
+
+        byte[] unsupportedReqRsp = BleGattSessionManager.buildLocalGattServerResponse(
+                new byte[] { 0x16, 0x03, 0x00, 0x00, 0x00, 0x41 });
+        check(unsupportedReqRsp != null && unsupportedReqRsp[0] == 0x01
+                && unsupportedReqRsp[1] == 0x16 && unsupportedReqRsp[4] == 0x06,
+                "Unsupported ATT Prepare_Write_Req (0x16) must return ATT_ERROR_RSP 0x06 Request Not Supported");
+
+        check(BleGattSessionManager.buildLocalGattServerResponse(new byte[] { 0x52, 0x09, 0x00, 0x00 }) == null,
+                "ATT_WRITE_CMD (0x52, bit 6 = 1) must NEVER elicit an ATT response");
 
         final ExecutorService hciRxExec = Executors.newSingleThreadExecutor();
         final BleGattSessionManager[] mgrRef = new BleGattSessionManager[1];
@@ -547,6 +600,8 @@ public final class ObdUnitTests {
         final AtomicInteger nextHandle = new AtomicInteger(0x0040);
         final AtomicInteger connUpdateHciCount = new AtomicInteger(0);
         final List<byte[]> l2capSigTx = Collections.synchronizedList(new ArrayList<byte[]>());
+        final List<byte[]> smpTx = Collections.synchronizedList(new ArrayList<byte[]>());
+        final List<byte[]> attServerRspTx = Collections.synchronizedList(new ArrayList<byte[]>());
 
         BtNativeBridge.Transport mockTransport = new BtNativeBridge.Transport() {
             @Override
@@ -604,6 +659,15 @@ public final class ObdUnitTests {
                     byte[] sig = new byte[acl.length - 8];
                     System.arraycopy(acl, 8, sig, 0, sig.length);
                     l2capSigTx.add(sig);
+                } else if (cid == BleGattSessionManager.L2CAP_CID_SMP && acl.length >= 10) {
+                    byte[] smp = new byte[acl.length - 8];
+                    System.arraycopy(acl, 8, smp, 0, smp.length);
+                    smpTx.add(smp);
+                } else if (cid == BleGattSessionManager.L2CAP_CID_ATT && attOp > 0
+                        && BleGattSessionManager.isAttResponseOpcode(attOp)) {
+                    byte[] rsp = new byte[acl.length - 8];
+                    System.arraycopy(acl, 8, rsp, 0, rsp.length);
+                    attServerRspTx.add(rsp);
                 }
                 hciRxExec.execute(new Runnable() {
                     @Override
@@ -759,21 +823,36 @@ public final class ObdUnitTests {
             check(!l2capSigTx.isEmpty() && (l2capSigTx.get(0)[0] & 0xFF) == 0x13 && l2capSigTx.get(0)[4] == 0x01,
                     "Slow L2CAP 0x12 request must send L2CAP 0x13 Rejected (0x0001)");
 
-            // Test 1b: Fast L2CAP 0x12 request (minInt=16 [20ms], maxInt=32 [40ms], lat=0, timeout=400)
-            // MUST be accepted (0x0000) and update connIntervalUnits cleanly!
+            // Test 1b: Exact Veepeak RTL8762 L2CAP 0x12 request from real-car logs
+            // (minInt=16 [20ms], maxInt=32 [40ms], lat=20, timeout=500) MUST be accepted (0x0000)
+            // while clamping effLatency=0 in HCI_LE_CONNECTION_UPDATE!
             serverLines.clear();
             l2capSigTx.clear();
-            byte[] fastConnReq = new byte[] {
+            byte[] vpConnReq = new byte[] {
                     0x12, 0x08, 0x08, 0x00,
                     0x10, 0x00,        // minInt = 16 (20ms)
                     0x20, 0x00,        // maxInt = 32 (40ms)
-                    0x00, 0x00,        // lat = 0
-                    (byte) 0x90, 0x01  // timeout = 400 (4.0s)
+                    0x14, 0x00,        // lat = 20 (Central clamps effLatency=0!)
+                    (byte) 0xF4, 0x01  // timeout = 500 (5.0s)
             };
-            mgr.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(0x0040, BleGattSessionManager.L2CAP_CID_LE_SIGNALING, fastConnReq));
-            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM ACCEPTED min=16 max=32 lat=0 timeout=400", 2000L);
-            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM UPDATED interval=16 lat=0 timeout=400", 2000L);
-            check(connUpdateHciCount.get() == 1, "Fast L2CAP 0x12 request must issue HCI_LE_CONNECTION_UPDATE");
+            mgr.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(0x0040, BleGattSessionManager.L2CAP_CID_LE_SIGNALING, vpConnReq));
+            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM ACCEPTED min=16 max=32 lat=0 timeout=500", 2000L);
+            waitForLine(serverLines, "@" + vpMac + " CONN_PARAM UPDATED interval=16 lat=0 timeout=500", 2000L);
+            check(connUpdateHciCount.get() == 1, "Veepeak L2CAP 0x12 request must issue HCI_LE_CONNECTION_UPDATE with lat=0");
+
+            // Test 1c: Inbound SMP_Security_Request (0x0B) on CID 0x0006 must immediately receive
+            // SMP_Pairing_Failed [0x05, 0x05] so peripheral's 30.0s SMP Timer never stalls GATT!
+            serverLines.clear();
+            smpTx.clear();
+            mgr.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(
+                    0x0040, BleGattSessionManager.L2CAP_CID_SMP, new byte[] { 0x0B, 0x01 }));
+            waitForLine(serverLines, "@" + vpMac + " PEER_REQ cid=0x0006 rx=0b01 tx=0505", 2000L);
+            long smpDeadline = System.currentTimeMillis() + 1000L;
+            while (smpTx.isEmpty() && System.currentTimeMillis() < smpDeadline) {
+                Thread.sleep(20L);
+            }
+            check(!smpTx.isEmpty() && smpTx.get(0).length == 2 && smpTx.get(0)[0] == 0x05 && smpTx.get(0)[1] == 0x05,
+                    "SMP_Security_Request must receive SMP_Pairing_Failed [0x05, 0x05] on CID 0x0006");
 
             // Test 2: Drop 0x13 Number_Of_Completed_Packets and issue 5 WRITE_CHAR_NR on Veepeak
             // (exceeding 4 credits) — must reclaim stale credits and NEVER fail with ACL_TX_FAILED!
@@ -807,6 +886,24 @@ public final class ObdUnitTests {
             check(bvmElapsed < 400L,
                     "BVM02 GATT op must not block behind slow Veepeak ATT op (elapsed=" + bvmElapsed + "ms)");
             waitForLine(serverLines, "@" + vpMac + " OP_OK READ_CHAR fff1 4f4b", 2000L);
+
+            // Test 3b: Inbound peripheral ATT Request (Realtek ANCS 0x06) arriving mid-transactAtt!
+            // Must NOT corrupt pendingAttResponse AND must immediately send ATT_ERROR_RSP (0x0A)!
+            slowVpReadMs.set(250);
+            serverLines.clear();
+            attServerRspTx.clear();
+            clientWrite.write(("@" + vpMac + " READ_CHAR fff1\n").getBytes(UTF8));
+            clientWrite.flush();
+            Thread.sleep(40L); // Ensure Veepeak READ_CHAR is waiting inside transactAtt
+            mgr.onLeAcl(BleGattSessionManager.wrapLeAclL2cap(
+                    0x0040, BleGattSessionManager.L2CAP_CID_ATT, findAncs));
+            waitForLine(serverLines, "@" + vpMac + " PEER_REQ cid=0x0004 rx=060100ffff0028", 2000L);
+            waitForLine(serverLines, "@" + vpMac + " OP_OK READ_CHAR fff1 4f4b", 2000L);
+            check(!attServerRspTx.isEmpty()
+                    && attServerRspTx.get(0)[0] == 0x01
+                    && attServerRspTx.get(0)[1] == 0x06
+                    && attServerRspTx.get(0)[4] == 0x0A,
+                    "Mid-transactAtt peripheral ATT request must receive ATT_ERROR_RSP without corrupting READ_CHAR");
 
             // Test 4: Start a slow READ_CHAR on Veepeak (250ms) and immediately issue @<BVM_MAC> DISCONNECT!
             // Disconnecting BVM02 MUST NOT abort Veepeak's in-flight ATT transaction!

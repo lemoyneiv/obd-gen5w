@@ -55,10 +55,18 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     public static final int HCI_LE_CREATE_CONNECTION          = 0x200D;
     public static final int HCI_LE_CREATE_CONNECTION_CANCEL   = 0x200E;
     public static final int HCI_LE_CONNECTION_UPDATE          = 0x2013;
+    public static final int HCI_LE_LTK_REQ_NEG_REPLY          = 0x201B;
 
     // L2CAP Fixed CIDs
     public static final int L2CAP_CID_ATT                     = 0x0004;
     public static final int L2CAP_CID_LE_SIGNALING            = 0x0005;
+    public static final int L2CAP_CID_SMP                     = 0x0006;
+
+    // SMP Opcodes (L2CAP CID 0x0006)
+    public static final int SMP_PAIRING_REQ                   = 0x01;
+    public static final int SMP_PAIRING_FAILED                = 0x05;
+    public static final int SMP_SECURITY_REQ                  = 0x0B;
+    public static final int SMP_ERR_PAIRING_NOT_SUPPORTED     = 0x05;
 
     // ATT Opcodes
     public static final int ATT_ERROR_RSP                     = 0x01;
@@ -66,19 +74,29 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     public static final int ATT_EXCHANGE_MTU_RSP              = 0x03;
     public static final int ATT_FIND_INFO_REQ                 = 0x04;
     public static final int ATT_FIND_INFO_RSP                 = 0x05;
+    public static final int ATT_FIND_BY_TYPE_VALUE_REQ        = 0x06;
+    public static final int ATT_FIND_BY_TYPE_VALUE_RSP        = 0x07;
     public static final int ATT_READ_BY_TYPE_REQ              = 0x08;
     public static final int ATT_READ_BY_TYPE_RSP              = 0x09;
     public static final int ATT_READ_REQ                      = 0x0A;
     public static final int ATT_READ_RSP                      = 0x0B;
     public static final int ATT_READ_BLOB_REQ                 = 0x0C;
     public static final int ATT_READ_BLOB_RSP                 = 0x0D;
+    public static final int ATT_READ_MULTIPLE_REQ             = 0x0E;
+    public static final int ATT_READ_MULTIPLE_RSP             = 0x0F;
     public static final int ATT_READ_BY_GROUP_TYPE_REQ        = 0x10;
     public static final int ATT_READ_BY_GROUP_TYPE_RSP        = 0x11;
     public static final int ATT_WRITE_REQ                     = 0x12;
     public static final int ATT_WRITE_RSP                     = 0x13;
+    public static final int ATT_PREPARE_WRITE_REQ             = 0x16;
+    public static final int ATT_PREPARE_WRITE_RSP             = 0x17;
+    public static final int ATT_EXECUTE_WRITE_REQ             = 0x18;
+    public static final int ATT_EXECUTE_WRITE_RSP             = 0x19;
     public static final int ATT_HANDLE_VALUE_NTF              = 0x1B;
     public static final int ATT_HANDLE_VALUE_IND              = 0x1D;
     public static final int ATT_HANDLE_VALUE_CFM              = 0x1E;
+    public static final int ATT_READ_MULTIPLE_VARIABLE_RSP    = 0x21;
+    public static final int ATT_MULTIPLE_HANDLE_VALUE_NTF     = 0x23;
     public static final int ATT_WRITE_CMD                     = 0x52;
 
     public interface LineEmitter {
@@ -197,6 +215,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         volatile int connIntervalUnits = 0;
         volatile int connLatency = 0;
         volatile int connTimeoutUnits = 0;
+        volatile int peerReqCount = 0;
 
         // Per-handle outbound LE ACL credit count (protected by hciLock)
         int inflightAcl = 0;
@@ -406,6 +425,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                         sb.append(",int=").append(c.connIntervalUnits)
                                 .append(",lat=").append(c.connLatency)
                                 .append(",to=").append(c.connTimeoutUnits);
+                    }
+                    if (c.peerReqCount > 0) {
+                        sb.append(",peerReqs=").append(c.peerReqCount);
                     }
                     sb.append(')');
                 }
@@ -2328,6 +2350,22 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                                 "CONN_PARAM UPDATE_ERR status=0x" + Integer.toHexString(st));
                     }
                 }
+            } else if (sub == 0x05 && ev.length >= 13) { // LE_Long_Term_Key_Request
+                final byte hLo = ev[3];
+                final byte hHi = (byte) (ev[4] & 0x0F);
+                final int h = ((hHi & 0xFF) << 8) | (hLo & 0xFF);
+                boolean ours;
+                synchronized (hciLock) {
+                    ours = connectionsByHandle.containsKey(Integer.valueOf(h));
+                }
+                if (ours) {
+                    enqueueRxReply(new Runnable() {
+                        @Override
+                        public void run() {
+                            sendHciCmdSync(HCI_LE_LTK_REQ_NEG_REPLY, new byte[]{hLo, hHi}, 500L);
+                        }
+                    });
+                }
             }
         }
     }
@@ -2389,14 +2427,24 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
     }
 
-    private void handleCompleteL2capSdu(final LeConnection conn, int cid, byte[] pdu) {
+    private void emitPeerReqLog(LeConnection conn, int cid, byte[] reqPdu, byte[] rspPdu) {
+        int n = ++conn.peerReqCount;
+        if (n <= 16) {
+            conn.owner.emitForConn(conn.mac,
+                    "PEER_REQ cid=0x" + String.format(Locale.US, "%04x", Integer.valueOf(cid))
+                            + " rx=" + bytesToHexPrefix(reqPdu, 24)
+                            + " tx=" + bytesToHexPrefix(rspPdu, 24));
+        }
+    }
+
+    private void handleCompleteL2capSdu(final LeConnection conn, final int cid, final byte[] pdu) {
         if (conn == null || conn.closed || pdu.length == 0) return;
 
         if (cid == L2CAP_CID_LE_SIGNALING) {
-            // L2CAP Connection Parameter Update Request (0x12) from peripheral (e.g. QN902x 20s timer).
-            // Offloaded to Gen5wBleRxReply so ObdHciRxReader NEVER blocks on ACL credits or HCI status,
-            // and rejects slow power-saving intervals (>60ms minInt) that stall multi-frame ISO-TP GATT!
-            if ((pdu[0] & 0xFF) == 0x12 && pdu.length >= 12) {
+            int sigCode = pdu[0] & 0xFF;
+            // L2CAP Connection Parameter Update Request (0x12) from peripheral.
+            // Offloaded to Gen5wBleRxReply so ObdHciRxReader NEVER blocks on ACL credits or HCI status.
+            if (sigCode == 0x12 && pdu.length >= 12) {
                 final byte identifier = pdu[1];
                 final int minInt = u16le(pdu, 4);
                 final int maxInt = u16le(pdu, 6);
@@ -2437,6 +2485,42 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                         sendHciCmdStatusSync(HCI_LE_CONNECTION_UPDATE, upd, 1000L);
                     }
                 });
+                return;
+            }
+            // Reject unsupported L2CAP LE Signaling requests (e.g. 0x14 LE Credit Based Conn Req)
+            if (sigCode != 0x01 && sigCode != 0x07 && sigCode != 0x13 && sigCode != 0x15 && pdu.length >= 2) {
+                final byte[] cmdRej = new byte[]{0x01, pdu[1], 0x02, 0x00, 0x00, 0x00};
+                emitPeerReqLog(conn, cid, pdu, cmdRej);
+                enqueueRxReply(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (conn.closed || conn.closingRequested) return;
+                        sendL2capPdu(conn.handle, L2CAP_CID_LE_SIGNALING, cmdRej, 500L);
+                    }
+                });
+            }
+            return;
+        }
+
+        if (cid == L2CAP_CID_SMP) {
+            // Security Manager Protocol (CID 0x0006):
+            // If a peripheral (e.g. Realtek RTL8762) sends SMP_Security_Request (0x0B) or
+            // SMP_Pairing_Request (0x01), immediately reply SMP_Pairing_Failed (0x05 = Pairing Not Supported)
+            // so its 30.0-second SMP Security Manager Timer terminates cleanly instead of stalling GATT!
+            int smpCode = pdu[0] & 0xFF;
+            if (smpCode == SMP_SECURITY_REQ || smpCode == SMP_PAIRING_REQ) {
+                final byte[] smpFail = new byte[]{
+                        (byte) SMP_PAIRING_FAILED,
+                        (byte) SMP_ERR_PAIRING_NOT_SUPPORTED
+                };
+                emitPeerReqLog(conn, cid, pdu, smpFail);
+                enqueueRxReply(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (conn.closed || conn.closingRequested) return;
+                        sendL2capPdu(conn.handle, L2CAP_CID_SMP, smpFail, 500L);
+                    }
+                });
             }
             return;
         }
@@ -2446,19 +2530,26 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
 
         int attOp = pdu[0] & 0xFF;
-        if (attOp == ATT_EXCHANGE_MTU_REQ && pdu.length >= 3) {
-            int peerRxMtu = u16le(pdu, 1);
-            final int ourMaxMtu = conn.preferredServerMtu;
-            conn.attMtu = Math.max(DEFAULT_ATT_MTU, Math.min(peerRxMtu, ourMaxMtu));
+        if (attOp == ATT_EXCHANGE_MTU_REQ) {
+            final byte[] mtuRsp;
+            if (pdu.length >= 3) {
+                int peerRxMtu = u16le(pdu, 1);
+                int ourMaxMtu = conn.preferredServerMtu;
+                conn.attMtu = Math.max(DEFAULT_ATT_MTU, Math.min(peerRxMtu, ourMaxMtu));
+                mtuRsp = new byte[]{
+                        (byte) ATT_EXCHANGE_MTU_RSP,
+                        (byte) (ourMaxMtu & 0xFF),
+                        (byte) ((ourMaxMtu >> 8) & 0xFF)
+                };
+            } else {
+                mtuRsp = attErrorRsp(ATT_EXCHANGE_MTU_REQ, 0x0000, 0x04);
+            }
+            emitPeerReqLog(conn, cid, pdu, mtuRsp);
             enqueueRxReply(new Runnable() {
                 @Override
                 public void run() {
                     if (conn.closed || conn.closingRequested) return;
-                    sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{
-                            (byte) ATT_EXCHANGE_MTU_RSP,
-                            (byte) (ourMaxMtu & 0xFF),
-                            (byte) ((ourMaxMtu >> 8) & 0xFF)
-                    }, 500L);
+                    sendL2capPdu(conn.handle, L2CAP_CID_ATT, mtuRsp, 500L);
                 }
             });
             return;
@@ -2466,11 +2557,13 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
         if (attOp == ATT_HANDLE_VALUE_NTF || attOp == ATT_HANDLE_VALUE_IND) {
             if (attOp == ATT_HANDLE_VALUE_IND) {
+                final byte[] cfm = new byte[]{(byte) ATT_HANDLE_VALUE_CFM};
+                emitPeerReqLog(conn, cid, pdu, cfm);
                 enqueueRxReply(new Runnable() {
                     @Override
                     public void run() {
                         if (conn.closed || conn.closingRequested) return;
-                        sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{(byte) ATT_HANDLE_VALUE_CFM}, 500L);
+                        sendL2capPdu(conn.handle, L2CAP_CID_ATT, cfm, 500L);
                     }
                 });
             }
@@ -2495,28 +2588,345 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             return;
         }
 
-        synchronized (conn.attLock) {
-            if (conn.attAwaitingResponse) {
-                conn.pendingAttResponse = pdu;
-                conn.attLock.notifyAll();
+        // Deliver ONLY genuine ATT Response PDUs to our outbound GATT Client waiter (transactAtt).
+        // Inbound peripheral ATT Requests (e.g. Realtek RTL8762 reverse GATT client querying 0x1800,
+        // 0x1801, 0x2A00 Device Name, or Apple ANCS via 0x06/0x08/0x10) MUST NEVER corrupt pendingAttResponse
+        // and MUST receive an immediate ATT_*_RSP / ATT_ERROR_RSP before the Bluetooth 30.0s ATT timeout!
+        if (isAttResponseOpcode(attOp)) {
+            synchronized (conn.attLock) {
+                if (conn.attAwaitingResponse) {
+                    conn.pendingAttResponse = pdu;
+                    conn.attLock.notifyAll();
+                }
             }
+            return;
+        }
+
+        final byte[] serverRsp = buildLocalGattServerResponse(pdu);
+        if (serverRsp != null) {
+            emitPeerReqLog(conn, cid, pdu, serverRsp);
+            enqueueRxReply(new Runnable() {
+                @Override
+                public void run() {
+                    if (conn.closed || conn.closingRequested) return;
+                    sendL2capPdu(conn.handle, L2CAP_CID_ATT, serverRsp, 500L);
+                }
+            });
         }
     }
 
     // ================= PURE STATIC CODECS (HOST-UNIT-TESTABLE) =================
 
     /**
+     * Returns {@code true} strictly for ATT Response opcodes (replies to our outbound Central GATT
+     * Client requests), preventing inbound peripheral GATT Client requests from colliding with
+     * {@link #transactAtt(LeConnection, byte[], long)}.
+     */
+    public static boolean isAttResponseOpcode(int attOp) {
+        switch (attOp & 0xFF) {
+            case ATT_ERROR_RSP:
+            case ATT_EXCHANGE_MTU_RSP:
+            case ATT_FIND_INFO_RSP:
+            case ATT_FIND_BY_TYPE_VALUE_RSP:
+            case ATT_READ_BY_TYPE_RSP:
+            case ATT_READ_RSP:
+            case ATT_READ_BLOB_RSP:
+            case ATT_READ_MULTIPLE_RSP:
+            case ATT_READ_BY_GROUP_TYPE_RSP:
+            case ATT_WRITE_RSP:
+            case ATT_PREPARE_WRITE_RSP:
+            case ATT_EXECUTE_WRITE_RSP:
+            case ATT_READ_MULTIPLE_VARIABLE_RSP:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static final int[] LOCAL_GATT_UUID16 = new int[]{
+            0x0000,
+            0x2800, // 0x0001: Primary Service (0x1800 Generic Access)
+            0x2803, // 0x0002: Characteristic Declaration (0x2A00 Device Name)
+            0x2A00, // 0x0003: Device Name value ("Gen5W")
+            0x2803, // 0x0004: Characteristic Declaration (0x2A01 Appearance)
+            0x2A01, // 0x0005: Appearance value (0x0000)
+            0x2800, // 0x0006: Primary Service (0x1801 Generic Attribute)
+            0x2803, // 0x0007: Characteristic Declaration (0x2A05 Service Changed)
+            0x2A05, // 0x0008: Service Changed value (Indicate-only)
+            0x2902  // 0x0009: CCCD for Service Changed
+    };
+
+    public static byte[] attErrorRsp(int reqOp, int handle, int errCode) {
+        return new byte[]{
+                (byte) ATT_ERROR_RSP,
+                (byte) (reqOp & 0xFF),
+                (byte) (handle & 0xFF),
+                (byte) ((handle >> 8) & 0xFF),
+                (byte) (errCode & 0xFF)
+        };
+    }
+
+    /**
+     * Stateless, Bluetooth 4.x compliant minimal Local GAP/GATT Server for {@code CID 0x0004}.
+     *
+     * Exposes {@code 0x1800 Generic Access} ({@code 0x0001..0x0005}: {@code 0x2A00} Device Name =
+     * {@code "Gen5W"}, {@code 0x2A01} Appearance = {@code 0x0000}) and {@code 0x1801 Generic Attribute}
+     * ({@code 0x0006..0x0009}: {@code 0x2A05} Service Changed + {@code 0x2902} CCCD), and returns
+     * proper {@code ATT_ERROR_RSP} ({@code 0x0A Attribute Not Found} / {@code 0x06 Request Not Supported})
+     * for all other inbound peripheral ATT Requests (such as Realtek RTL8762 {@code gaps_client} and
+     * {@code ancs_client} queries), preventing the Bluetooth Core Spec 30.0-second ATT Transaction
+     * Timeout from locking the peripheral's ATT bearer!
+     *
+     * Returns {@code null} for ATT Commands (bit 6 = 1), Notifications, Confirmations, or Responses,
+     * which per Bluetooth Core Spec Vol 3 Part F Section 3.4.1.1 must never elicit a response.
+     */
+    public static byte[] buildLocalGattServerResponse(byte[] pdu) {
+        if (pdu == null || pdu.length == 0) return null;
+        int op = pdu[0] & 0xFF;
+        // Never respond to ATT Commands (bit 6 = 0x40), Responses, Notifications, Indications, or Confirmations
+        if ((op & 0x40) != 0
+                || isAttResponseOpcode(op)
+                || op == ATT_HANDLE_VALUE_NTF
+                || op == ATT_HANDLE_VALUE_IND
+                || op == ATT_HANDLE_VALUE_CFM
+                || op == ATT_MULTIPLE_HANDLE_VALUE_NTF) {
+            return null;
+        }
+
+        if (op == ATT_EXCHANGE_MTU_REQ) {
+            if (pdu.length < 3) return attErrorRsp(op, 0x0000, 0x04);
+            return new byte[]{
+                    (byte) ATT_EXCHANGE_MTU_RSP,
+                    (byte) (DEFAULT_ATT_MTU & 0xFF),
+                    (byte) ((DEFAULT_ATT_MTU >> 8) & 0xFF)
+            };
+        }
+
+        if (op == ATT_READ_BY_GROUP_TYPE_REQ) {
+            if (pdu.length != 7 && pdu.length != 21) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int startH = u16le(pdu, 1);
+            int endH = u16le(pdu, 3);
+            if (startH == 0 || startH > endH) {
+                return attErrorRsp(op, startH, 0x01);
+            }
+            String groupUuid = decodeAttUuid(pdu, 5, pdu.length - 5);
+            if ("2800".equals(groupUuid)) {
+                boolean inc1800 = (startH <= 0x0001 && endH >= 0x0001);
+                boolean inc1801 = (startH <= 0x0006 && endH >= 0x0006);
+                if (!inc1800 && !inc1801) {
+                    return attErrorRsp(op, startH, 0x0A);
+                }
+                int count = (inc1800 ? 1 : 0) + (inc1801 ? 1 : 0);
+                byte[] out = new byte[2 + count * 6];
+                out[0] = (byte) ATT_READ_BY_GROUP_TYPE_RSP;
+                out[1] = 0x06;
+                int pos = 2;
+                if (inc1800) {
+                    out[pos++] = 0x01; out[pos++] = 0x00;
+                    out[pos++] = 0x05; out[pos++] = 0x00;
+                    out[pos++] = 0x00; out[pos++] = 0x18;
+                }
+                if (inc1801) {
+                    out[pos++] = 0x06; out[pos++] = 0x00;
+                    out[pos++] = 0x09; out[pos++] = 0x00;
+                    out[pos++] = 0x01; out[pos++] = 0x18;
+                }
+                return out;
+            }
+            if ("2801".equals(groupUuid)) {
+                return attErrorRsp(op, startH, 0x0A);
+            }
+            return attErrorRsp(op, startH, 0x10);
+        }
+
+        if (op == ATT_FIND_BY_TYPE_VALUE_REQ) {
+            if (pdu.length < 7) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int startH = u16le(pdu, 1);
+            int endH = u16le(pdu, 3);
+            int attrType = u16le(pdu, 5);
+            if (startH == 0 || startH > endH) {
+                return attErrorRsp(op, startH, 0x01);
+            }
+            int valLen = pdu.length - 7;
+            if (attrType == 0x2800 && (valLen == 2 || valLen == 16)) {
+                String targetSvc = decodeAttUuid(pdu, 7, valLen);
+                if ("1800".equals(targetSvc) && startH <= 0x0001 && endH >= 0x0001) {
+                    return new byte[]{(byte) ATT_FIND_BY_TYPE_VALUE_RSP, 0x01, 0x00, 0x05, 0x00};
+                }
+                if ("1801".equals(targetSvc) && startH <= 0x0006 && endH >= 0x0006) {
+                    return new byte[]{(byte) ATT_FIND_BY_TYPE_VALUE_RSP, 0x06, 0x00, 0x09, 0x00};
+                }
+            }
+            return attErrorRsp(op, startH, 0x0A);
+        }
+
+        if (op == ATT_READ_BY_TYPE_REQ) {
+            if (pdu.length != 7 && pdu.length != 21) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int startH = u16le(pdu, 1);
+            int endH = u16le(pdu, 3);
+            if (startH == 0 || startH > endH) {
+                return attErrorRsp(op, startH, 0x01);
+            }
+            String attrUuid = decodeAttUuid(pdu, 5, pdu.length - 5);
+            if ("2803".equals(attrUuid)) {
+                ByteArrayOutputStream items = new ByteArrayOutputStream(21);
+                if (startH <= 0x0002 && endH >= 0x0002) {
+                    items.write(new byte[]{0x02, 0x00, 0x02, 0x03, 0x00, 0x00, 0x2A}, 0, 7);
+                }
+                if (startH <= 0x0004 && endH >= 0x0004) {
+                    items.write(new byte[]{0x04, 0x00, 0x02, 0x05, 0x00, 0x01, 0x2A}, 0, 7);
+                }
+                if (startH <= 0x0007 && endH >= 0x0007) {
+                    items.write(new byte[]{0x07, 0x00, 0x20, 0x08, 0x00, 0x05, 0x2A}, 0, 7);
+                }
+                if (items.size() == 0) {
+                    return attErrorRsp(op, startH, 0x0A);
+                }
+                byte[] body = items.toByteArray();
+                byte[] out = new byte[2 + body.length];
+                out[0] = (byte) ATT_READ_BY_TYPE_RSP;
+                out[1] = 0x07;
+                System.arraycopy(body, 0, out, 2, body.length);
+                return out;
+            }
+            if ("2a00".equals(attrUuid) && startH <= 0x0003 && endH >= 0x0003) {
+                return new byte[]{(byte) ATT_READ_BY_TYPE_RSP, 0x07, 0x03, 0x00, 'G', 'e', 'n', '5', 'W'};
+            }
+            if ("2a01".equals(attrUuid) && startH <= 0x0005 && endH >= 0x0005) {
+                return new byte[]{(byte) ATT_READ_BY_TYPE_RSP, 0x04, 0x05, 0x00, 0x00, 0x00};
+            }
+            if ("2800".equals(attrUuid)) {
+                ByteArrayOutputStream items = new ByteArrayOutputStream(8);
+                if (startH <= 0x0001 && endH >= 0x0001) {
+                    items.write(new byte[]{0x01, 0x00, 0x00, 0x18}, 0, 4);
+                }
+                if (startH <= 0x0006 && endH >= 0x0006) {
+                    items.write(new byte[]{0x06, 0x00, 0x01, 0x18}, 0, 4);
+                }
+                if (items.size() == 0) {
+                    return attErrorRsp(op, startH, 0x0A);
+                }
+                byte[] body = items.toByteArray();
+                byte[] out = new byte[2 + body.length];
+                out[0] = (byte) ATT_READ_BY_TYPE_RSP;
+                out[1] = 0x04;
+                System.arraycopy(body, 0, out, 2, body.length);
+                return out;
+            }
+            if ("2902".equals(attrUuid) && startH <= 0x0009 && endH >= 0x0009) {
+                return new byte[]{(byte) ATT_READ_BY_TYPE_RSP, 0x04, 0x09, 0x00, 0x00, 0x00};
+            }
+            if ("2a05".equals(attrUuid) && startH <= 0x0008 && endH >= 0x0008) {
+                return attErrorRsp(op, 0x0008, 0x02);
+            }
+            return attErrorRsp(op, startH, 0x0A);
+        }
+
+        if (op == ATT_FIND_INFO_REQ) {
+            if (pdu.length != 5) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int startH = u16le(pdu, 1);
+            int endH = u16le(pdu, 3);
+            if (startH == 0 || startH > endH) {
+                return attErrorRsp(op, startH, 0x01);
+            }
+            int lo = Math.max(1, startH);
+            int hi = Math.min(9, endH);
+            if (lo > hi) {
+                return attErrorRsp(op, startH, 0x0A);
+            }
+            int count = Math.min(5, hi - lo + 1);
+            byte[] out = new byte[2 + count * 4];
+            out[0] = (byte) ATT_FIND_INFO_RSP;
+            out[1] = 0x01; // 16-bit UUIDs
+            int pos = 2;
+            for (int i = 0; i < count; i++) {
+                int h = lo + i;
+                int u16 = LOCAL_GATT_UUID16[h];
+                out[pos++] = (byte) (h & 0xFF);
+                out[pos++] = (byte) ((h >> 8) & 0xFF);
+                out[pos++] = (byte) (u16 & 0xFF);
+                out[pos++] = (byte) ((u16 >> 8) & 0xFF);
+            }
+            return out;
+        }
+
+        if (op == ATT_READ_REQ) {
+            if (pdu.length != 3) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int h = u16le(pdu, 1);
+            switch (h) {
+                case 0x0001:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x00, 0x18};
+                case 0x0002:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x02, 0x03, 0x00, 0x00, 0x2A};
+                case 0x0003:
+                    return new byte[]{(byte) ATT_READ_RSP, 'G', 'e', 'n', '5', 'W'};
+                case 0x0004:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x02, 0x05, 0x00, 0x01, 0x2A};
+                case 0x0005:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x00, 0x00};
+                case 0x0006:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x01, 0x18};
+                case 0x0007:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x20, 0x08, 0x00, 0x05, 0x2A};
+                case 0x0008:
+                    return attErrorRsp(op, 0x0008, 0x02);
+                case 0x0009:
+                    return new byte[]{(byte) ATT_READ_RSP, 0x00, 0x00};
+                default:
+                    return attErrorRsp(op, h, 0x01);
+            }
+        }
+
+        if (op == ATT_READ_BLOB_REQ) {
+            if (pdu.length != 5) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int h = u16le(pdu, 1);
+            return attErrorRsp(op, h, (h >= 1 && h <= 9) ? 0x0B : 0x01);
+        }
+
+        if (op == ATT_WRITE_REQ) {
+            if (pdu.length < 3) {
+                return attErrorRsp(op, 0x0000, 0x04);
+            }
+            int h = u16le(pdu, 1);
+            if (h == 0x0009) {
+                if (pdu.length != 5) {
+                    return attErrorRsp(op, 0x0009, 0x0D);
+                }
+                return new byte[]{(byte) ATT_WRITE_RSP};
+            }
+            return attErrorRsp(op, h, (h >= 1 && h <= 8) ? 0x03 : 0x01);
+        }
+
+        int errHandle = (op != ATT_EXECUTE_WRITE_REQ && pdu.length >= 3) ? u16le(pdu, 1) : 0x0000;
+        return attErrorRsp(op, errHandle, 0x06);
+    }
+
+    /**
      * Validates an L2CAP {@code 0x12} Connection Parameter Update Request from a BLE peripheral.
-     * Rejects slow power-saving connection intervals ({@code minInt > 48} = {@code > 60 ms}) or
-     * non-trivial slave latency ({@code latency > 1}) so multi-frame ISO-TP GATT notifications
-     * never exceed command timeouts or desynchronize ELM327 {@code '>'} prompts.
+     * Accepts fast, coexistence-safe intervals ({@code 12 <= minInt <= 48}, i.e. {@code 15..60 ms},
+     * such as Veepeak RTL8762's {@code min=16, max=32, lat=20, timeout=500}) — note that the Central
+     * clamps {@code effLatency = 0} in {@code HCI_LE_CONNECTION_UPDATE} for zero-lag GATT RX — while
+     * rejecting both ultra-tight {@code < 15 ms} requests (e.g. BVM02 {@code min=8}) and sluggish
+     * {@code > 60 ms} power-saving intervals (e.g. QN902x {@code min=160}).
      */
     public static boolean shouldAcceptConnParamUpdate(int minInt, int maxInt, int latency, int timeout) {
         if (minInt < 6 || maxInt < minInt || maxInt > 3200) return false;
         if (latency < 0 || latency > 499) return false;
         if (timeout < 10 || timeout > 3200) return false;
         if ((timeout * 4) <= (1 + latency) * maxInt) return false;
-        return minInt <= 48 && latency <= 1 && timeout >= 100;
+        return minInt >= 12 && minInt <= 48 && timeout >= 100;
     }
 
     public static int clampMtu(int mtu) {
@@ -2778,6 +3188,21 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             int v = b[i] & 0xFF;
             if (v < 0x10) sb.append('0');
             sb.append(Integer.toHexString(v));
+        }
+        return sb.toString();
+    }
+
+    private static String bytesToHexPrefix(byte[] b, int maxBytes) {
+        if (b == null || b.length == 0) return "-";
+        int lim = Math.min(b.length, Math.max(1, maxBytes));
+        StringBuilder sb = new StringBuilder(lim * 2 + 4);
+        for (int i = 0; i < lim; i++) {
+            int v = b[i] & 0xFF;
+            if (v < 0x10) sb.append('0');
+            sb.append(Integer.toHexString(v));
+        }
+        if (b.length > lim) {
+            sb.append("..");
         }
         return sb.toString();
     }

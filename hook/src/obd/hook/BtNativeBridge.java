@@ -311,6 +311,7 @@ public final class BtNativeBridge {
                 "/data/app-lib/obd.app-2",
                 "/data/app-lib/obd.app-3",
                 "/data/app-lib/obd.app-4",
+                "/data/app-lib/obd.app-5",
                 "/data/app-lib/obd.app"
         };
         for (int i = 0; i < fallbackDirs.length; i++) {

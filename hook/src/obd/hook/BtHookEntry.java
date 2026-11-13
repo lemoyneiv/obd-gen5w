@@ -13,7 +13,7 @@ import hmgapi.hook.ModEntry;
  */
 public final class BtHookEntry extends ModEntry {
 
-    public static final String HOOK_VERSION = "0.1.3";
+    public static final String HOOK_VERSION = "0.1.4";
     private static final String BT_PACKAGE = "com.android.bluetooth";
 
     @Override

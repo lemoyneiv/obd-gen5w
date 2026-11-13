@@ -164,6 +164,8 @@ public final class BleCoordinator {
     private final List<String> triedServiceOverrides = new ArrayList<String>();
     private final Map<String, List<String>> discoveredServicesByMac = new LinkedHashMap<String, List<String>>();
     private volatile int obdTimeoutStreak = 0;
+    private volatile int consecutivePromptTimeouts = 0;
+    private volatile int scanGeneration = 0;
     private volatile long nextObdReconnectMs = 0L;
     private volatile Elm327Protocol.GattBinding obdBinding = null;
     private volatile List<Elm327Protocol.GattBinding> obdCandidates = Collections.emptyList();
@@ -374,11 +376,27 @@ public final class BleCoordinator {
         synchronized (discovered) {
             discovered.clear();
         }
+        final int gen = ++scanGeneration;
         bleClient.startScan();
         notifyUi();
+        if (!testMode) {
+            Thread timer = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    sleepQuiet(20000L);
+                    if (!stopWorker.get() && scanning && scanGeneration == gen) {
+                        DiagLogger.get().info("BLE", "Auto-stopping BLE scan after 20s discovery window");
+                        stopBleScan();
+                    }
+                }
+            }, "ObdBleScanAutoStop");
+            timer.setDaemon(true);
+            timer.start();
+        }
     }
 
     public void stopBleScan() {
+        scanGeneration++;
         bleClient.stopScan();
         notifyUi();
     }
@@ -402,6 +420,7 @@ public final class BleCoordinator {
             prefs.setObdAdapter(clean, this.obdName, addrType);
         }
         DiagLogger.get().info("OBD", "Pairing OBD adapter " + clean + " (" + this.obdName + ", addrType=" + addrType + ")");
+        scanGeneration++;
         bleClient.stopScan();
         bleClient.connectDevice(clean, addrType, "*");
         notifyUi();
@@ -442,6 +461,8 @@ public final class BleCoordinator {
                 prefs.setBvm02Enabled(true);
             }
         }
+        scanGeneration++;
+        bleClient.stopScan();
         bleClient.connectDevice(clean, addrType, "fff0");
         notifyUi();
     }
@@ -658,6 +679,7 @@ public final class BleCoordinator {
         }
 
         runElmInitSequence();
+        consecutivePromptTimeouts = 0;
         boolean hadLiveSessionResponse = (ver != null && !ver.isEmpty());
 
         String currentCanHeader = "";
@@ -686,6 +708,7 @@ public final class BleCoordinator {
             if (needReinitAfterBridge.compareAndSet(true, false)) {
                 DiagLogger.get().info("OBD", "TCP bridge client disconnected; restoring E-GMP CAN framing");
                 runElmInitSequence();
+                consecutivePromptTimeouts = 0;
                 currentCanHeader = "";
             }
 
@@ -723,80 +746,117 @@ public final class BleCoordinator {
                         ? new String[] { "220102", "220103", "220104", "22010A", "22010B" }
                         : new String[] { "220102", "220103", "220104", "22010A", "22010B", "22010C" };
                 int okBlocks = 0;
-                for (int i = 0; i < cellDids.length && obdConnected && bridgeClientCount == 0; i++) {
+                boolean abortedByStall = isAdapterUnresponsive();
+                for (int i = 0; !abortedByStall && i < cellDids.length && obdConnected && bridgeClientCount == 0; i++) {
                     if (queryIsoTpAndApply(cellDids[i], 2000L)) {
                         okBlocks++;
+                    } else if (isAdapterUnresponsive()) {
+                        abortedByStall = true;
+                        break;
                     }
                 }
-                DiagLogger.get().info("OBD", "Completed HV cell sweep (" + okBlocks + "/" + cellDids.length
-                        + " blocks, " + telemetry.snapshot().populatedCellCount + " cells)");
-                notifyUi();
+                if (abortedByStall && okBlocks == 0) {
+                    pendingCellScan.set(true);
+                    DiagLogger.get().warn("OBD", "HV cell sweep interrupted by BLE prompt timeout; re-queued for reconnect");
+                } else {
+                    DiagLogger.get().info("OBD", "Completed HV cell sweep (" + okBlocks + "/" + cellDids.length
+                            + " blocks, " + telemetry.snapshot().populatedCellCount + " cells)");
+                    notifyUi();
+                }
             }
 
             // 4. Cyclic Telemetry Schedule
+            // Note: isAdapterUnresponsive() triggers ONLY when ELM327 '>' prompts stop arriving
+            // (never on 'NO DATA >'), allowing dead GATT links to jump straight to ATI recovery in <4.5s!
             boolean gotData = false;
-            if (vehicleProfile == EgmpTelemetry.PROFILE_GENERIC) {
-                if (!"".equals(currentCanHeader)) {
-                    sendElmCommandBlocking("ATSH7DF", 800L);
-                    sendElmCommandBlocking("ATAR", 800L);
-                    currentCanHeader = "";
-                }
-                gotData |= queryIsoTpAndApply("010D", 1100L);
-                gotData |= queryIsoTpAndApply("010C", 1100L);
-                if ((cycle % 3) == 0) {
-                    gotData |= queryIsoTpAndApply("0105", 1100L);
-                    gotData |= queryIsoTpAndApply("0142", 1100L);
-                    String rv = sendElmCommandBlocking("ATRV", 900L);
-                    telemetry.updateAtRvVolts(Elm327Protocol.parseAtRvVolts(rv));
-                }
-                rateCommands += 2;
-            } else {
-                boolean medCycle = ((cycle % 3) == 0) && bridgeClientCount == 0;
-
-                // Keep 7E4/7EC selected across BMS fast (220101) + medium (220105, 220106) queries
-                currentCanHeader = switchTargetEcu(currentCanHeader, "7E4", "7EC");
-                gotData |= queryIsoTpAndApply("220101", 2200L);
-                rateCommands++;
-                if (medCycle) {
-                    gotData |= queryIsoTpAndApply("220105", 2000L);
-                    gotData |= queryIsoTpAndApply("220106", 1600L);
+            if (!isAdapterUnresponsive()) {
+                if (vehicleProfile == EgmpTelemetry.PROFILE_GENERIC) {
+                    if (!"".equals(currentCanHeader)) {
+                        sendElmCommandBlocking("ATSH7DF", 800L);
+                        if (!isAdapterUnresponsive()) {
+                            sendElmCommandBlocking("ATAR", 800L);
+                        }
+                        currentCanHeader = "";
+                    }
+                    if (!isAdapterUnresponsive()) {
+                        gotData |= queryIsoTpAndApply("010D", 1100L);
+                    }
+                    if (!isAdapterUnresponsive()) {
+                        gotData |= queryIsoTpAndApply("010C", 1100L);
+                    }
+                    if ((cycle % 3) == 0 && !isAdapterUnresponsive()) {
+                        gotData |= queryIsoTpAndApply("0105", 1100L);
+                        if (!isAdapterUnresponsive()) {
+                            gotData |= queryIsoTpAndApply("0142", 1100L);
+                        }
+                        if (!isAdapterUnresponsive()) {
+                            String rv = sendElmCommandBlocking("ATRV", 900L);
+                            telemetry.updateAtRvVolts(Elm327Protocol.parseAtRvVolts(rv));
+                        }
+                    }
                     rateCommands += 2;
-                }
+                } else {
+                    boolean medCycle = ((cycle % 3) == 0) && bridgeClientCount == 0;
 
-                // ABS/ESC 7D1 -> 7D9: Speed & Gear
-                if (bridgeClientCount == 0) {
-                    currentCanHeader = switchTargetEcu(currentCanHeader, "7D1", "7D9");
-                    gotData |= queryIsoTpAndApply("220104", 1500L);
-                    rateCommands++;
-                }
-
-                // ICCU LDC 7E5 -> 7ED: 12V DC-DC + Aux 12V Sensor
-                if (medCycle && bridgeClientCount == 0) {
-                    currentCanHeader = switchTargetEcu(currentCanHeader, "7E5", "7ED");
-                    String iccuCmd = iccuUseMy25Did ? "22E101" : "22E011";
-                    boolean iccuOk = queryIsoTpAndApply(iccuCmd, 1600L);
-                    if (!iccuOk) {
-                        iccuUseMy25Did = !iccuUseMy25Did;
+                    // Keep 7E4/7EC selected across BMS fast (220101) + medium (220105, 220106) queries
+                    currentCanHeader = switchTargetEcu(currentCanHeader, "7E4", "7EC");
+                    if (!isAdapterUnresponsive()) {
+                        gotData |= queryIsoTpAndApply("220101", 2200L);
+                        rateCommands++;
                     }
-                    gotData |= iccuOk;
-                    rateCommands++;
-                }
-
-                // E-GMP Slow Cycle: TPMS 22C00B + Cluster Odometer 22B002 + Adapter ATRV
-                if ((cycle % 10) == 0 && bridgeClientCount == 0) {
-                    currentCanHeader = switchTargetEcu(currentCanHeader, "7A0", "7A8");
-                    gotData |= queryIsoTpAndApply("22C00B", 1600L);
-
-                    currentCanHeader = switchTargetEcu(currentCanHeader, "7C6", "7CE");
-                    gotData |= queryIsoTpAndApply("22B002", 1500L);
-
-                    String rv = sendElmCommandBlocking("ATRV", 1000L);
-                    float parsedRv = Elm327Protocol.parseAtRvVolts(rv);
-                    if (!Float.isNaN(parsedRv)) {
-                        hadLiveSessionResponse = true;
-                        telemetry.updateAtRvVolts(parsedRv);
+                    if (medCycle && !isAdapterUnresponsive()) {
+                        gotData |= queryIsoTpAndApply("220105", 2000L);
+                        if (!isAdapterUnresponsive()) {
+                            gotData |= queryIsoTpAndApply("220106", 1600L);
+                        }
+                        rateCommands += 2;
                     }
-                    rateCommands += 3;
+
+                    // ABS/ESC 7D1 -> 7D9: Speed & Gear
+                    if (bridgeClientCount == 0 && !isAdapterUnresponsive()) {
+                        currentCanHeader = switchTargetEcu(currentCanHeader, "7D1", "7D9");
+                        if (!isAdapterUnresponsive()) {
+                            gotData |= queryIsoTpAndApply("220104", 1500L);
+                            rateCommands++;
+                        }
+                    }
+
+                    // ICCU LDC 7E5 -> 7ED: 12V DC-DC + Aux 12V Sensor
+                    if (medCycle && bridgeClientCount == 0 && !isAdapterUnresponsive()) {
+                        currentCanHeader = switchTargetEcu(currentCanHeader, "7E5", "7ED");
+                        if (!isAdapterUnresponsive()) {
+                            String iccuCmd = iccuUseMy25Did ? "22E101" : "22E011";
+                            boolean iccuOk = queryIsoTpAndApply(iccuCmd, 1600L);
+                            if (!iccuOk && !isAdapterUnresponsive()) {
+                                iccuUseMy25Did = !iccuUseMy25Did;
+                            }
+                            gotData |= iccuOk;
+                            rateCommands++;
+                        }
+                    }
+
+                    // E-GMP Slow Cycle: TPMS 22C00B + Cluster Odometer 22B002 + Adapter ATRV
+                    if ((cycle % 10) == 0 && bridgeClientCount == 0 && !isAdapterUnresponsive()) {
+                        currentCanHeader = switchTargetEcu(currentCanHeader, "7A0", "7A8");
+                        if (!isAdapterUnresponsive()) {
+                            gotData |= queryIsoTpAndApply("22C00B", 1600L);
+                        }
+                        if (!isAdapterUnresponsive()) {
+                            currentCanHeader = switchTargetEcu(currentCanHeader, "7C6", "7CE");
+                        }
+                        if (!isAdapterUnresponsive()) {
+                            gotData |= queryIsoTpAndApply("22B002", 1500L);
+                        }
+                        if (!isAdapterUnresponsive()) {
+                            String rv = sendElmCommandBlocking("ATRV", 1000L);
+                            float parsedRv = Elm327Protocol.parseAtRvVolts(rv);
+                            if (!Float.isNaN(parsedRv)) {
+                                hadLiveSessionResponse = true;
+                                telemetry.updateAtRvVolts(parsedRv);
+                            }
+                            rateCommands += 3;
+                        }
+                    }
                 }
             }
 
@@ -817,10 +877,11 @@ public final class BleCoordinator {
                 sleepQuiet(60L);
             } else {
                 consecutiveNoData++;
-                if (consecutiveNoData == 3) {
+                boolean promptDead = isAdapterUnresponsive();
+                if ((promptDead || consecutiveNoData == 3) && obdConnected) {
                     bleClient.requestBridgeStatus();
                 }
-                if (consecutiveNoData >= 3 && obdConnected && bridgeClientCount == 0) {
+                if ((promptDead || consecutiveNoData >= 3) && obdConnected && bridgeClientCount == 0) {
                     // Distinguish genuine IG OFF (adapter still answers ATI immediately from Pin 16 +12V)
                     // from a stalled BLE UART link (ATI itself times out -> auto-cycle BLE session).
                     String alive = sendElmCommandBlocking("ATI", 1100L);
@@ -857,6 +918,10 @@ public final class BleCoordinator {
         pollHz = 0.0f;
     }
 
+    private boolean isAdapterUnresponsive() {
+        return consecutivePromptTimeouts >= 2;
+    }
+
     private void scheduleReconnectKick(final long delayMs) {
         Thread kick = new Thread(new Runnable() {
             @Override
@@ -882,8 +947,14 @@ public final class BleCoordinator {
         if (txHeader.equals(currentHeader)) {
             return currentHeader;
         }
-        sendElmCommandBlocking("ATSH" + txHeader, 900L);
-        sendElmCommandBlocking("ATCRA" + rxFilter, 900L);
+        String r1 = sendElmCommandBlocking("ATSH" + txHeader, 900L);
+        if (r1 == null && isAdapterUnresponsive()) {
+            return "";
+        }
+        String r2 = sendElmCommandBlocking("ATCRA" + rxFilter, 900L);
+        if (r2 == null && isAdapterUnresponsive()) {
+            return "";
+        }
         return txHeader;
     }
 
@@ -891,8 +962,14 @@ public final class BleCoordinator {
         if ("7DF".equals(currentHeader)) {
             return currentHeader;
         }
-        sendElmCommandBlocking("ATSH7DF", 900L);
-        sendElmCommandBlocking("ATAR", 900L);
+        String r1 = sendElmCommandBlocking("ATSH7DF", 900L);
+        if (r1 == null && isAdapterUnresponsive()) {
+            return "";
+        }
+        String r2 = sendElmCommandBlocking("ATAR", 900L);
+        if (r2 == null && isAdapterUnresponsive()) {
+            return "";
+        }
         return "7DF";
     }
 
@@ -900,6 +977,7 @@ public final class BleCoordinator {
         List<ObdDtcCodec.DtcEntry> all = new ArrayList<ObdDtcCodec.DtcEntry>();
         String[] modes = { "03", "07", "0A" };
         for (int i = 0; i < modes.length; i++) {
+            if (isAdapterUnresponsive()) break;
             String raw = sendElmCommandBlocking(modes[i], 2500L);
             if (raw != null && !Elm327Protocol.isErrorOrNoData(raw)) {
                 List<Elm327Protocol.IsoTpMessage> msgs = Elm327Protocol.parseIsoTpMessages(raw, true);
@@ -951,17 +1029,25 @@ public final class BleCoordinator {
             }
             result = latestPromptResponse;
         }
-        // If a multi-frame command timed out before '>' arrived (e.g., slow SEARCHING... or late CAN burst),
-        // send a bare CR to abort any in-flight ELM327 CAN wait and drain '>' so the next command never
-        // suffers off-by-one '>' prompt desynchronization!
-        if (result == null && obdConnected && bridgeClientCount == 0
-                && !"ATI".equalsIgnoreCase(cmd) && !"ATZ".equalsIgnoreCase(cmd)) {
-            resyncElmPrompt(mac, binding, 450L);
+        if (result != null) {
+            consecutivePromptTimeouts = 0;
+            return result;
         }
-        return result;
+        if (obdConnected && bridgeClientCount == 0) {
+            int streak = ++consecutivePromptTimeouts;
+            // On the FIRST command timeout, send a bare CR to abort any in-flight ELM327 CAN wait
+            // and drain '>' so the next command never suffers off-by-one '>' prompt desynchronization.
+            // Skip on consecutive timeouts so a dead GATT bearer fails fast without extra 450ms stalls!
+            if (streak == 1 && !"ATI".equalsIgnoreCase(cmd) && !"ATZ".equalsIgnoreCase(cmd)) {
+                if (resyncElmPrompt(mac, binding, 450L)) {
+                    consecutivePromptTimeouts = 0;
+                }
+            }
+        }
+        return null;
     }
 
-    private void resyncElmPrompt(String mac, Elm327Protocol.GattBinding binding, long drainMs) {
+    private boolean resyncElmPrompt(String mac, Elm327Protocol.GattBinding binding, long drainMs) {
         synchronized (promptLock) {
             latestPromptResponse = null;
         }
@@ -978,8 +1064,10 @@ public final class BleCoordinator {
                     break;
                 }
             }
+            boolean gotPrompt = (latestPromptResponse != null);
             latestPromptResponse = null;
             promptBuffer.reset();
+            return gotPrompt;
         }
     }
 
@@ -1253,6 +1341,7 @@ public final class BleCoordinator {
                 obdGattRejected = false;
                 pendingTargetedSvcRetry = false;
                 obdTimeoutStreak = 0;
+                consecutivePromptTimeouts = 0;
                 nextObdReconnectMs = 0L;
                 obdCandidates = candidates;
                 obdBinding = binding;
@@ -1467,7 +1556,8 @@ public final class BleCoordinator {
 
         @Override
         public void onConnectionParamsUpdated(String mac, String summary) {
-            DiagLogger.get().info("BLE", "Conn params " + (mac != null && !mac.isEmpty() ? (mac + " ") : "")
+            String prefix = (summary != null && summary.startsWith("PEER_REQ")) ? "Peer BLE req " : "Conn params ";
+            DiagLogger.get().info("BLE", prefix + (mac != null && !mac.isEmpty() ? (mac + " ") : "")
                     + summary);
         }
 

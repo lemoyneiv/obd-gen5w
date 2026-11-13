@@ -255,6 +255,12 @@ public final class Gen5wBleClient {
             }
             return;
         }
+        if ("PEER_REQ".equals(head) && p.length >= 2) {
+            if (listener != null) {
+                listener.onConnectionParamsUpdated(mac, line);
+            }
+            return;
+        }
         if ("CONN_STATE".equals(head) && p.length >= 3) {
             String st = p[1];
             String devMac = p[2];

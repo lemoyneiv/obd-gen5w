@@ -1,7 +1,7 @@
 {
   "id": "obd-gen5w",
   "name": "OBD-II & E-GMP Telemetry",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "hmgapi": ">=1.0.0",
   "authors": ["lemoyneiv"],
   "license": "AGPL-3.0",
