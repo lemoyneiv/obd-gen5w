@@ -101,8 +101,21 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
     }
 
+    public static final class DiscoveredService {
+        public final String uuid;
+        public final int startHandle;
+        public final int endHandle;
+
+        public DiscoveredService(String uuid, int startHandle, int endHandle) {
+            this.uuid = uuid;
+            this.startHandle = startHandle;
+            this.endHandle = endHandle;
+        }
+    }
+
     public static final class DiscoveredChar {
         public final String shortUuid;
+        public final String serviceUuid;
         public final int declHandle;
         public final int valHandle;
         public final int props;
@@ -111,7 +124,12 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         public volatile boolean notifySubscribed;
 
         public DiscoveredChar(String shortUuid, int declHandle, int valHandle, int props) {
+            this(shortUuid, "", declHandle, valHandle, props);
+        }
+
+        public DiscoveredChar(String shortUuid, String serviceUuid, int declHandle, int valHandle, int props) {
             this.shortUuid = shortUuid;
+            this.serviceUuid = (serviceUuid != null) ? serviceUuid : "";
             this.declHandle = declHandle;
             this.valHandle = valHandle;
             this.props = props;
@@ -847,7 +865,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
         int[] candidateAddrTypes;
         if (addrTypeHint == 0 || addrTypeHint == 1) {
-            candidateAddrTypes = new int[]{addrTypeHint};
+            candidateAddrTypes = new int[]{addrTypeHint, addrTypeHint == 0 ? 1 : 0};
         } else {
             Integer cached = getCachedAddrType(mac);
             if (cached != null) {
@@ -881,7 +899,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                         return;
                     }
                     int peerAddrType = candidateAddrTypes[attempt];
-                    long waitMs = (candidateAddrTypes.length == 1) ? 9500L : 5500L;
+                    long waitMs = (attempt == 0) ? 5500L : 4000L;
 
                     synchronized (hciLock) {
                         pendingLeConnEvent = null;
@@ -1081,6 +1099,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         boolean wildcard = "*".equals(serviceFilter);
         int targetSvcStart = 0;
         int targetSvcEnd = 0;
+        List<DiscoveredService> services = new ArrayList<DiscoveredService>();
 
         // 1. Discover Primary Services (UUID 0x2800) via ATT_READ_BY_GROUP_TYPE_REQ (0x10)
         int curStart = 0x0001;
@@ -1113,6 +1132,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 int sHandle = u16le(rsp, pos);
                 int eHandle = u16le(rsp, pos + 2);
                 String svcUuid = decodeAttUuid(rsp, pos + 4, itemLen - 4);
+                if (sHandle > 0 && eHandle >= sHandle) {
+                    services.add(new DiscoveredService(svcUuid, sHandle, eHandle));
+                }
                 conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_SVC %s %04x %04x",
                         svcUuid, Integer.valueOf(sHandle), Integer.valueOf(eHandle)));
                 if (!wildcard && serviceFilter.equals(svcUuid)) {
@@ -1129,68 +1151,87 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             curStart = lastEnd + 1;
         }
 
-        int searchStart = (!wildcard && targetSvcStart > 0 && targetSvcEnd >= targetSvcStart)
-                ? targetSvcStart : 0x0001;
-        int searchEnd = (!wildcard && targetSvcStart > 0 && targetSvcEnd >= targetSvcStart)
-                ? targetSvcEnd : 0xFFFF;
-
-        // 2. Discover Characteristics (UUID 0x2803) via ATT_READ_BY_TYPE_REQ (0x08)
-        List<DiscoveredChar> discovered = new ArrayList<DiscoveredChar>();
-        curStart = searchStart;
-        guard = 0;
-        while (curStart <= searchEnd && guard++ < 128) {
-            byte[] req = new byte[]{
-                    (byte) ATT_READ_BY_TYPE_REQ,
-                    (byte) (curStart & 0xFF), (byte) ((curStart >> 8) & 0xFF),
-                    (byte) (searchEnd & 0xFF), (byte) ((searchEnd >> 8) & 0xFF),
-                    0x03, 0x28
-            };
-            byte[] rsp = transactAtt(conn, req, 3000L);
-            if (rsp == null) {
-                disconnectConnection(conn, true, "ATT_CHAR_DISCOVERY_TIMEOUT");
-                return false;
+        // 2. Build per-service handle ranges (matching Bluedroid / CoreBluetooth per-service discovery
+        //    so dual-mode Beken/JieLi/ISSC chips with handle gaps between services never abort early).
+        List<DiscoveredService> rangesToScan = new ArrayList<DiscoveredService>();
+        if (!wildcard) {
+            if (targetSvcStart > 0 && targetSvcEnd >= targetSvcStart) {
+                rangesToScan.add(new DiscoveredService(serviceFilter, targetSvcStart, targetSvcEnd));
+            } else {
+                rangesToScan.add(new DiscoveredService(serviceFilter, 0x0001, 0xFFFF));
             }
-            int op = rsp[0] & 0xFF;
-            if (op == ATT_ERROR_RSP) {
-                break;
-            }
-            if (op != ATT_READ_BY_TYPE_RSP || rsp.length < 4) {
-                break;
-            }
-            int itemLen = rsp[1] & 0xFF;
-            if (itemLen != 7 && itemLen != 21) {
-                break;
-            }
-            int maxHandleSeen = curStart;
-            for (int pos = 2; pos + itemLen <= rsp.length; pos += itemLen) {
-                int declHandle = u16le(rsp, pos);
-                int props = rsp[pos + 2] & 0xFF;
-                int valHandle = u16le(rsp, pos + 3);
-                String charUuid = decodeAttUuid(rsp, pos + 5, itemLen - 5);
-                discovered.add(new DiscoveredChar(charUuid, declHandle, valHandle, props));
-                int stepHandle = Math.max(declHandle, valHandle);
-                if (stepHandle > maxHandleSeen) {
-                    maxHandleSeen = stepHandle;
-                }
-            }
-            if (maxHandleSeen >= searchEnd || maxHandleSeen >= 0xFFFF) {
-                break;
-            }
-            curStart = maxHandleSeen + 1;
+        } else if (!services.isEmpty()) {
+            rangesToScan.addAll(services);
+        } else {
+            rangesToScan.add(new DiscoveredService("", 0x0001, 0xFFFF));
         }
 
-        for (int i = 0; i < discovered.size(); i++) {
-            DiscoveredChar c = discovered.get(i);
-            c.endHandle = (i + 1 < discovered.size())
-                    ? Math.max(c.valHandle, discovered.get(i + 1).declHandle - 1)
-                    : Math.max(c.valHandle, searchEnd);
-            synchronized (conn.attLock) {
-                conn.charByUuid.put(c.shortUuid, c);
-                conn.charByValHandle.put(Integer.valueOf(c.valHandle), c);
+        // 3. Discover Characteristics (UUID 0x2803) via ATT_READ_BY_TYPE_REQ (0x08) inside each service range
+        for (int rIdx = 0; rIdx < rangesToScan.size(); rIdx++) {
+            DiscoveredService svcRange = rangesToScan.get(rIdx);
+            int rangeStart = svcRange.startHandle;
+            int rangeEnd = svcRange.endHandle;
+            List<DiscoveredChar> svcChars = new ArrayList<DiscoveredChar>();
+
+            curStart = rangeStart;
+            guard = 0;
+            while (curStart <= rangeEnd && guard++ < 64) {
+                byte[] req = new byte[]{
+                        (byte) ATT_READ_BY_TYPE_REQ,
+                        (byte) (curStart & 0xFF), (byte) ((curStart >> 8) & 0xFF),
+                        (byte) (rangeEnd & 0xFF), (byte) ((rangeEnd >> 8) & 0xFF),
+                        0x03, 0x28
+                };
+                byte[] rsp = transactAtt(conn, req, 3000L);
+                if (rsp == null) {
+                    disconnectConnection(conn, true, "ATT_CHAR_DISCOVERY_TIMEOUT");
+                    return false;
+                }
+                int op = rsp[0] & 0xFF;
+                if (op == ATT_ERROR_RSP) {
+                    break;
+                }
+                if (op != ATT_READ_BY_TYPE_RSP || rsp.length < 4) {
+                    break;
+                }
+                int itemLen = rsp[1] & 0xFF;
+                if (itemLen != 7 && itemLen != 21) {
+                    break;
+                }
+                int maxHandleSeen = curStart;
+                for (int pos = 2; pos + itemLen <= rsp.length; pos += itemLen) {
+                    int declHandle = u16le(rsp, pos);
+                    int props = rsp[pos + 2] & 0xFF;
+                    int valHandle = u16le(rsp, pos + 3);
+                    String charUuid = decodeAttUuid(rsp, pos + 5, itemLen - 5);
+                    svcChars.add(new DiscoveredChar(charUuid, svcRange.uuid, declHandle, valHandle, props));
+                    int stepHandle = Math.max(declHandle, valHandle);
+                    if (stepHandle > maxHandleSeen) {
+                        maxHandleSeen = stepHandle;
+                    }
+                }
+                if (maxHandleSeen >= rangeEnd || maxHandleSeen >= 0xFFFF) {
+                    break;
+                }
+                curStart = maxHandleSeen + 1;
             }
-            conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_CHAR %s %02x %04x %04x",
-                    c.shortUuid, Integer.valueOf(c.props),
-                    Integer.valueOf(c.valHandle), Integer.valueOf(c.endHandle)));
+
+            for (int i = 0; i < svcChars.size(); i++) {
+                DiscoveredChar c = svcChars.get(i);
+                c.endHandle = (i + 1 < svcChars.size())
+                        ? Math.max(c.valHandle, Math.min(rangeEnd, svcChars.get(i + 1).declHandle - 1))
+                        : Math.max(c.valHandle, rangeEnd);
+                synchronized (conn.attLock) {
+                    DiscoveredChar existing = conn.charByUuid.get(c.shortUuid);
+                    if (existing == null || shouldPreferCharacteristic(existing, c)) {
+                        conn.charByUuid.put(c.shortUuid, c);
+                    }
+                    conn.charByValHandle.put(Integer.valueOf(c.valHandle), c);
+                }
+                conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_CHAR %s %02x %04x %04x",
+                        c.shortUuid, Integer.valueOf(c.props),
+                        Integer.valueOf(c.valHandle), Integer.valueOf(c.endHandle)));
+            }
         }
 
         boolean serviceSatisfied;
@@ -1225,6 +1266,26 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         conn.owner.emitForConn(conn.mac,
                 "GATT_READY " + conn.mac + " " + (specCsv.length() > 0 ? specCsv.toString() : "none"));
         return true;
+    }
+
+    private static boolean isSystemGattService(String svcUuid) {
+        return "1800".equals(svcUuid) || "1801".equals(svcUuid) || "180a".equals(svcUuid);
+    }
+
+    private static boolean shouldPreferCharacteristic(DiscoveredChar existing, DiscoveredChar candidate) {
+        if (existing == null) return true;
+        if (isSystemGattService(existing.serviceUuid) && !isSystemGattService(candidate.serviceUuid)) {
+            return true;
+        }
+        if (!isSystemGattService(existing.serviceUuid) && isSystemGattService(candidate.serviceUuid)) {
+            return false;
+        }
+        int existingActive = existing.props & 0x3C;  // WRITE_NR | WRITE | NOTIFY | INDICATE
+        int candidateActive = candidate.props & 0x3C;
+        if (candidateActive != 0 && existingActive == 0) {
+            return true;
+        }
+        return false;
     }
 
     private void handleRequestMtu(ClientSession session, String explicitMac, int desiredMtu) {
@@ -1616,6 +1677,14 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         if (rsp != null && (rsp[0] & 0xFF) == ATT_WRITE_RSP) {
             session.emitForConn(conn.mac, "OP_OK " + opName + " " + shortUuid);
         } else if (rsp != null && (rsp[0] & 0xFF) == ATT_ERROR_RSP && rsp.length >= 5) {
+            if (canWriteCmd) {
+                pdu[0] = (byte) ATT_WRITE_CMD;
+                boolean ok = sendL2capPdu(conn.handle, L2CAP_CID_ATT, pdu, 2500L);
+                if (ok) {
+                    session.emitForConn(conn.mac, "OP_OK " + opName + " " + shortUuid);
+                    return;
+                }
+            }
             session.emitForConn(conn.mac, "OP_ERR " + opName + " " + shortUuid + " ATT_ERR_0x"
                     + Integer.toHexString(rsp[4] & 0xFF));
         } else {

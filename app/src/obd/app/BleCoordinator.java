@@ -142,6 +142,9 @@ public final class BleCoordinator {
     private final Object promptLock = new Object();
     private String latestPromptResponse = null;
 
+    private final Object notifyStateLock = new Object();
+    private String lastNotifyReadyUuid = "";
+
     private volatile boolean sessionReady = false;
     private volatile String bridgeServerVersion = "connecting";
     private volatile boolean scanning = false;
@@ -155,7 +158,15 @@ public final class BleCoordinator {
     private volatile int obdLastRssi = 0;
     private volatile boolean obdConnecting = false;
     private volatile boolean obdConnected = false;
+    private volatile boolean obdGattRejected = false;
+    private volatile String obdServiceFilterOverride = "*";
+    private volatile boolean pendingTargetedSvcRetry = false;
+    private final List<String> triedServiceOverrides = new ArrayList<String>();
+    private final Map<String, List<String>> discoveredServicesByMac = new LinkedHashMap<String, List<String>>();
+    private volatile int obdTimeoutStreak = 0;
+    private volatile long nextObdReconnectMs = 0L;
     private volatile Elm327Protocol.GattBinding obdBinding = null;
+    private volatile List<Elm327Protocol.GattBinding> obdCandidates = Collections.emptyList();
     private volatile int obdChunkBytes = 20;
     private volatile String obdStatusText = "Unpaired";
     private volatile String elmVersionText = "idle";
@@ -194,6 +205,17 @@ public final class BleCoordinator {
         }
     }
 
+    private void resetObdRetryState() {
+        obdGattRejected = false;
+        obdServiceFilterOverride = "*";
+        pendingTargetedSvcRetry = false;
+        obdTimeoutStreak = 0;
+        nextObdReconnectMs = 0L;
+        synchronized (triedServiceOverrides) {
+            triedServiceOverrides.clear();
+        }
+    }
+
     public void reloadFromPrefs() {
         if (prefs == null) return;
         this.obdMac = prefs.getObdMac().toUpperCase(Locale.US);
@@ -201,6 +223,7 @@ public final class BleCoordinator {
         this.obdAddrType = prefs.getObdAddrType();
         this.vehicleProfile = prefs.getVehicleProfile();
         this.bvmEnabled = prefs.isBvm02Enabled();
+        resetObdRetryState();
         if (obdMac.isEmpty()) {
             obdStatusText = "Unpaired";
         } else if (!obdConnected && !obdConnecting) {
@@ -370,11 +393,15 @@ public final class BleCoordinator {
         this.obdName = (name == null || name.trim().isEmpty()) ? "BLE OBD-II" : name.trim();
         this.obdAddrType = addrType;
         this.obdConnected = false;
+        this.obdConnecting = true;
         this.obdBinding = null;
+        this.obdCandidates = Collections.emptyList();
+        resetObdRetryState();
         this.obdStatusText = "Connecting...";
         if (prefs != null) {
             prefs.setObdAdapter(clean, this.obdName, addrType);
         }
+        DiagLogger.get().info("OBD", "Pairing OBD adapter " + clean + " (" + this.obdName + ", addrType=" + addrType + ")");
         bleClient.stopScan();
         bleClient.connectDevice(clean, addrType, "*");
         notifyUi();
@@ -389,6 +416,8 @@ public final class BleCoordinator {
         obdConnected = false;
         obdConnecting = false;
         obdBinding = null;
+        obdCandidates = Collections.emptyList();
+        resetObdRetryState();
         obdStatusText = "Unpaired";
         if (prefs != null) {
             prefs.clearObdAdapter();
@@ -418,6 +447,7 @@ public final class BleCoordinator {
     }
 
     public void requestReconnectAll() {
+        resetObdRetryState();
         if (!obdMac.isEmpty()) {
             obdConnected = false;
             obdConnecting = false;
@@ -483,10 +513,12 @@ public final class BleCoordinator {
 
     public void ensureConfiguredDevicesConnected() {
         if (!sessionReady) return;
-        if (!obdMac.isEmpty() && !obdConnected && !obdConnecting) {
+        long now = System.currentTimeMillis();
+        if (!obdMac.isEmpty() && !obdConnected && !obdConnecting
+                && !obdGattRejected && now >= nextObdReconnectMs) {
             obdConnecting = true;
             obdStatusText = "Connecting...";
-            bleClient.connectDevice(obdMac, obdAddrType, "*");
+            bleClient.connectDevice(obdMac, obdAddrType, obdServiceFilterOverride);
         }
         if (bvmEnabled) {
             for (int i = 0; i < DevicePrefs.BVM_SLOTS; i++) {
@@ -539,20 +571,88 @@ public final class BleCoordinator {
         pollThread.start();
     }
 
-    private void runObdPollLoop() {
-        DiagLogger.get().info("OBD", "Starting ELM327 session init on " + obdMac);
-        // Brief settle after ENABLE_NOTIFY CCCD write
-        sleepQuiet(250L);
-
-        String ver = sendElmCommandBlocking("ATI", 2200L);
-        if (ver == null || ver.isEmpty()) {
-            ver = sendElmCommandBlocking("ATZ", 2500L);
+    private void awaitNotifyReady(String notifyUuid, long timeoutMs) {
+        String targetNorm = Gen5wBleAdvRecord.normalizeUuid(notifyUuid);
+        long deadline = System.currentTimeMillis() + Math.max(200L, timeoutMs);
+        synchronized (notifyStateLock) {
+            while (obdConnected && !targetNorm.equals(lastNotifyReadyUuid)) {
+                long rem = deadline - System.currentTimeMillis();
+                if (rem <= 0L) break;
+                try {
+                    notifyStateLock.wait(rem);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
+    }
+
+    private String probeCandidateBinding(Elm327Protocol.GattBinding candidate) {
+        if (!obdConnected || candidate == null || bridgeClientCount > 0) return null;
+        obdBinding = candidate;
+        String ver = sendElmCommandBlocking("ATI", 1800L);
+        if ((ver == null || ver.isEmpty()) && obdConnected && bridgeClientCount == 0) {
+            ver = sendElmCommandBlocking("ATZ", 2200L);
+        }
+        if ((ver == null || ver.isEmpty()) && candidate.supportsAlternateWriteMode()
+                && obdConnected && bridgeClientCount == 0) {
+            Elm327Protocol.GattBinding alt = candidate.withWriteWithoutResponse(!candidate.writeWithoutResponse);
+            DiagLogger.get().info("OBD", "Probing alternate write mode (wnr=" + alt.writeWithoutResponse
+                    + ") on " + alt.profileName);
+            obdBinding = alt;
+            ver = sendElmCommandBlocking("ATI", 1600L);
+        }
+        return ver;
+    }
+
+    private void runObdPollLoop() {
+        Elm327Protocol.GattBinding initial = obdBinding;
+        if (initial == null) return;
+        DiagLogger.get().info("OBD", "Starting ELM327 session init on " + obdMac
+                + " (" + initial.profileName + ")");
+
+        // Wait for ENABLE_NOTIFY CCCD write to complete before transmitting ATI!
+        awaitNotifyReady(initial.notifyUuid, 2500L);
+        sleepQuiet(120L);
+
+        String ver = probeCandidateBinding(initial);
+        List<Elm327Protocol.GattBinding> allCandidates = this.obdCandidates;
+        if ((ver == null || ver.isEmpty()) && allCandidates != null && allCandidates.size() > 1) {
+            for (int i = 1; i < allCandidates.size() && obdConnected && bridgeClientCount == 0; i++) {
+                Elm327Protocol.GattBinding next = allCandidates.get(i);
+                DiagLogger.get().info("OBD", "No ATI response on " + initial.profileName
+                        + "; probing fallback candidate " + next.profileName
+                        + " (notify=" + Elm327Protocol.normUuid(next.notifyUuid)
+                        + " write=" + Elm327Protocol.normUuid(next.writeUuid) + ")");
+                synchronized (notifyStateLock) {
+                    lastNotifyReadyUuid = "";
+                }
+                bleClient.enableNotifications(obdMac, next.notifyUuid);
+                awaitNotifyReady(next.notifyUuid, 2500L);
+                sleepQuiet(100L);
+                ver = probeCandidateBinding(next);
+                if (ver != null && !ver.isEmpty()) {
+                    obdStatusText = "GATT Ready (" + obdBinding.profileName + ")";
+                    notifyUi();
+                    break;
+                }
+            }
+            if ((ver == null || ver.isEmpty()) && obdConnected) {
+                // Restore primary candidate if all were silent (e.g. slow adapter cold boot)
+                obdBinding = initial;
+                bleClient.enableNotifications(obdMac, initial.notifyUuid);
+                awaitNotifyReady(initial.notifyUuid, 1500L);
+            }
+        }
+
         if (ver != null && !ver.isEmpty()) {
             String cleanVer = ver.replace('\r', ' ').replace('\n', ' ').trim();
             if (cleanVer.length() > 28) cleanVer = cleanVer.substring(0, 28);
             elmVersionText = cleanVer;
-            DiagLogger.get().info("OBD", "Adapter identified: " + cleanVer);
+            DiagLogger.get().info("OBD", "Adapter identified (" + obdBinding.profileName + "): " + cleanVer);
+        } else {
+            DiagLogger.get().warn("OBD", "No initial ATI/ATZ prompt on " + obdMac + "; proceeding to E-GMP init");
         }
 
         runElmInitSequence();
@@ -826,6 +926,58 @@ public final class BleCoordinator {
         }
     }
 
+    private List<String> snapshotDiscoveredServices(String upperMac) {
+        synchronized (discoveredServicesByMac) {
+            List<String> list = discoveredServicesByMac.get(upperMac);
+            return (list == null) ? Collections.<String>emptyList() : new ArrayList<String>(list);
+        }
+    }
+
+    private static String formatCharProps(Map<String, Integer> charPropsByUuid) {
+        if (charPropsByUuid == null || charPropsByUuid.isEmpty()) {
+            return "<empty>";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, Integer> e : charPropsByUuid.entrySet()) {
+            if (sb.length() > 0) sb.append(',');
+            int p = (e.getValue() == null) ? 0 : (e.getValue().intValue() & 0xFF);
+            sb.append(Elm327Protocol.normUuid(e.getKey()))
+              .append(':')
+              .append(String.format(Locale.US, "%02x", Integer.valueOf(p)));
+        }
+        return sb.toString();
+    }
+
+    private String pickNextCustomServiceOverride(List<String> svcs, Map<String, Integer> charPropsByUuid) {
+        if (svcs == null || svcs.isEmpty()) return null;
+        // Never retry custom services if the device already identified as an LNEX BVM02 sensor (fff4 present)
+        if (charPropsByUuid != null) {
+            for (String rawU : charPropsByUuid.keySet()) {
+                if ("fff4".equals(Elm327Protocol.normUuid(rawU))) {
+                    return null;
+                }
+            }
+        }
+        synchronized (triedServiceOverrides) {
+            for (int i = 0; i < svcs.size(); i++) {
+                String s = Elm327Protocol.normUuid(svcs.get(i));
+                if (s.isEmpty()
+                        || "1800".equals(s)
+                        || "1801".equals(s)
+                        || "180a".equals(s)
+                        || "180f".equals(s)
+                        || "1812".equals(s)) {
+                    continue;
+                }
+                if (!triedServiceOverrides.contains(s)) {
+                    triedServiceOverrides.add(s);
+                    return s;
+                }
+            }
+        }
+        return null;
+    }
+
     // ================= @GEN5W_BLE CALLBACK ROUTER =================
 
     private final class BleCallback extends Gen5wBleClient.SimpleListener {
@@ -854,6 +1006,16 @@ public final class BleCoordinator {
             String upperMac = mac.toUpperCase(Locale.US);
             if (upperMac.equals(obdMac)) {
                 obdLastRssi = rssi;
+                if (addrType == 0 || addrType == 1) {
+                    obdAddrType = addrType;
+                }
+                boolean wasBackedOff = (obdTimeoutStreak > 0 || nextObdReconnectMs > 0L);
+                obdTimeoutStreak = 0;
+                nextObdReconnectMs = 0L;
+                if (wasBackedOff && (uiForeground || keepAliveBackground)
+                        && !obdConnected && !obdConnecting && !obdGattRejected) {
+                    ensureConfiguredDevicesConnected();
+                }
             }
             String localName = (record != null && record.localName != null && !record.localName.isEmpty())
                     ? record.localName
@@ -894,10 +1056,37 @@ public final class BleCoordinator {
 
         @Override
         public void onConnecting(String mac) {
-            if (mac != null && mac.equalsIgnoreCase(obdMac)) {
+            if (mac == null) return;
+            String upperMac = mac.toUpperCase(Locale.US);
+            synchronized (discoveredServicesByMac) {
+                discoveredServicesByMac.remove(upperMac);
+            }
+            if (upperMac.equals(obdMac)) {
                 obdConnecting = true;
-                obdStatusText = "Connecting...";
+                obdStatusText = "*".equals(obdServiceFilterOverride)
+                        ? "Connecting..."
+                        : "Discovering (" + obdServiceFilterOverride + ")...";
                 notifyUi();
+            }
+        }
+
+        @Override
+        public void onGattServiceDiscovered(String mac, String serviceUuid, int startHandle, int endHandle) {
+            if (serviceUuid == null) return;
+            String effectiveMac = (mac != null && !mac.isEmpty()) ? mac : (obdConnecting ? obdMac : "");
+            if (effectiveMac.isEmpty()) return;
+            String upperMac = effectiveMac.toUpperCase(Locale.US);
+            String normSvc = Elm327Protocol.normUuid(serviceUuid);
+            if (normSvc.isEmpty()) return;
+            synchronized (discoveredServicesByMac) {
+                List<String> list = discoveredServicesByMac.get(upperMac);
+                if (list == null) {
+                    list = new ArrayList<String>();
+                    discoveredServicesByMac.put(upperMac, list);
+                }
+                if (!list.contains(normSvc)) {
+                    list.add(normSvc);
+                }
             }
         }
 
@@ -909,23 +1098,55 @@ public final class BleCoordinator {
             // 1. Primary OBD-II Adapter Session
             if (upperMac.equals(obdMac)) {
                 obdConnecting = false;
-                Elm327Protocol.GattBinding binding = Elm327Protocol.resolveAdapterBinding(charPropsByUuid);
-                if (binding == null) {
+                List<String> svcs = snapshotDiscoveredServices(upperMac);
+                String formattedChars = formatCharProps(charPropsByUuid);
+                DiagLogger.get().info("BLE", "GATT table on " + upperMac
+                        + " (filter=" + obdServiceFilterOverride + "): services=" + svcs
+                        + " chars=" + formattedChars);
+
+                List<Elm327Protocol.GattBinding> candidates = Elm327Protocol.resolveAdapterBindings(charPropsByUuid);
+                if (candidates.isEmpty()) {
+                    String nextSvc = pickNextCustomServiceOverride(svcs, charPropsByUuid);
+                    if (nextSvc != null) {
+                        obdServiceFilterOverride = nextSvc;
+                        pendingTargetedSvcRetry = true;
+                        obdConnected = false;
+                        obdStatusText = "Discovering (" + nextSvc + ")...";
+                        DiagLogger.get().info("OBD", "Wildcard GATT incomplete on " + upperMac
+                                + "; retrying targeted GATT discovery for service " + nextSvc);
+                        bleClient.disconnectDevice(upperMac);
+                        notifyUi();
+                        return;
+                    }
+                    obdGattRejected = true;
+                    pendingTargetedSvcRetry = false;
                     obdConnected = false;
                     obdStatusText = "Incompatible GATT";
-                    DiagLogger.get().error("OBD", "Rejected GATT table on " + upperMac + " (no ELM327 notify/write pair)");
+                    DiagLogger.get().error("OBD", "Rejected GATT table on " + upperMac
+                            + " (no ELM327 notify/write pair; services=" + svcs + " chars=" + formattedChars + ")");
                     bleClient.disconnectDevice(upperMac);
                     notifyUi();
                     return;
                 }
+
+                Elm327Protocol.GattBinding binding = candidates.get(0);
+                obdGattRejected = false;
+                pendingTargetedSvcRetry = false;
+                obdTimeoutStreak = 0;
+                nextObdReconnectMs = 0L;
+                obdCandidates = candidates;
                 obdBinding = binding;
                 obdChunkBytes = 20;
                 obdConnected = true;
                 obdStatusText = "GATT Ready (" + binding.profileName + ")";
                 DiagLogger.get().info("OBD", "Bound " + upperMac + " -> " + binding.profileName
-                        + " notify=" + binding.notifyUuid + " write=" + binding.writeUuid);
+                        + " notify=" + Elm327Protocol.normUuid(binding.notifyUuid)
+                        + " write=" + Elm327Protocol.normUuid(binding.writeUuid)
+                        + " (candidates=" + candidates.size() + ")");
 
-                bleClient.requestMtu(upperMac, 185);
+                synchronized (notifyStateLock) {
+                    lastNotifyReadyUuid = "";
+                }
                 bleClient.enableNotifications(upperMac, binding.notifyUuid);
                 startObdPollWorkerIfNeeded();
                 notifyUi();
@@ -957,11 +1178,30 @@ public final class BleCoordinator {
                 obdConnecting = false;
                 obdConnected = false;
                 obdBinding = null;
+                obdCandidates = Collections.emptyList();
                 pollHz = 0.0f;
-                obdStatusText = "Disconnected (" + reason + ")";
                 synchronized (promptLock) {
                     promptLock.notifyAll();
                 }
+                synchronized (notifyStateLock) {
+                    notifyStateLock.notifyAll();
+                }
+                if (pendingTargetedSvcRetry) {
+                    pendingTargetedSvcRetry = false;
+                    obdConnecting = true;
+                    obdStatusText = "Discovering (" + obdServiceFilterOverride + ")...";
+                    DiagLogger.get().info("OBD", "Reconnecting to " + upperMac
+                            + " with targeted service filter " + obdServiceFilterOverride);
+                    bleClient.connectDevice(upperMac, obdAddrType, obdServiceFilterOverride);
+                    notifyUi();
+                    return;
+                }
+                if ("CONNECT_TIMEOUT".equals(reason)) {
+                    obdTimeoutStreak++;
+                    long backoffMs = Math.min(24000L, 6000L * obdTimeoutStreak);
+                    nextObdReconnectMs = System.currentTimeMillis() + backoffMs;
+                }
+                obdStatusText = obdGattRejected ? "Incompatible GATT" : ("Disconnected (" + reason + ")");
                 DiagLogger.get().warn("OBD", "OBD adapter disconnected: " + upperMac + " reason=" + reason);
                 notifyUi();
                 return;
@@ -972,6 +1212,26 @@ public final class BleCoordinator {
                 bvm.statusLabel = "Disconnected";
                 DiagLogger.get().warn("BVM02", "BVM02 Slot " + (bvm.slot + 1) + " disconnected: " + reason);
                 notifyUi();
+            }
+        }
+
+        @Override
+        public void onNotificationStateChanged(String mac, String uuid, boolean enabled, String error) {
+            if (mac == null || uuid == null) return;
+            if (mac.equalsIgnoreCase(obdMac)) {
+                if (error != null) {
+                    DiagLogger.get().warn("OBD", "ENABLE_NOTIFY warning on " + mac.toUpperCase(Locale.US)
+                            + " uuid=" + Elm327Protocol.normUuid(uuid) + ": " + error);
+                } else if (enabled) {
+                    DiagLogger.get().info("OBD", "Notifications ready on " + mac.toUpperCase(Locale.US)
+                            + " uuid=" + Elm327Protocol.normUuid(uuid));
+                }
+                if (enabled || error != null) {
+                    synchronized (notifyStateLock) {
+                        lastNotifyReadyUuid = Gen5wBleAdvRecord.normalizeUuid(uuid);
+                        notifyStateLock.notifyAll();
+                    }
+                }
             }
         }
 
@@ -1064,6 +1324,12 @@ public final class BleCoordinator {
             obdConnected = false;
             obdConnecting = false;
             pollHz = 0.0f;
+            synchronized (promptLock) {
+                promptLock.notifyAll();
+            }
+            synchronized (notifyStateLock) {
+                notifyStateLock.notifyAll();
+            }
             DiagLogger.get().warn("BLE", "@gen5w_ble session closed: " + reason);
             notifyUi();
         }

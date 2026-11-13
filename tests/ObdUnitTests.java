@@ -46,6 +46,7 @@ public final class ObdUnitTests {
 
     public static void main(String[] args) throws Exception {
         testGattSafetyAndCommandGuardrails();
+        testTargetedServiceDiscoveryFallbackAndNotifyEvents();
         testChunkedBleIsoTpReassembly();
         testIoniq5EgmpDecoders();
         testMultiEcuDtcDecoding();
@@ -63,6 +64,60 @@ public final class ObdUnitTests {
         check(Elm327Protocol.UUID_FFF1_NOTIFY.equals(vp.notifyUuid), "Veepeak notify UUID must be FFF1");
         check(Elm327Protocol.UUID_FFF2_WRITE.equals(vp.writeUuid), "Veepeak write UUID must be FFF2");
         check(!vp.writeWithoutResponse, "Prefer WRITE with response when 0x08 is advertised");
+        check(vp.supportsAlternateWriteMode(), "0x0C write mask must advertise alternate write mode");
+
+        // 1b. Dual-mode BLE+SPP 0x18F0 profile (0x2AF0 Notify + 0x2AF1 Write) as used on dual-mode Veepeak/Beken chips
+        Map<String, Integer> dual18f0 = new LinkedHashMap<String, Integer>();
+        dual18f0.put("2a00", Integer.valueOf(0x0A));
+        dual18f0.put("2a05", Integer.valueOf(0x20));
+        dual18f0.put("2af0", Integer.valueOf(0x10));
+        dual18f0.put("2af1", Integer.valueOf(0x0C));
+        Elm327Protocol.GattBinding d18 = Elm327Protocol.resolveAdapterBinding(dual18f0);
+        check(d18 != null && "18F0 (Dual-Mode BLE)".equals(d18.profileName), "18F0 dual-mode GATT must resolve");
+        check(Elm327Protocol.UUID_2AF0_NOTIFY.equals(d18.notifyUuid), "18F0 notify must be 2AF0");
+        check(Elm327Protocol.UUID_2AF1_WRITE.equals(d18.writeUuid), "18F0 write must be 2AF1");
+
+        // 1c. Reversed FFF0 profile (FFF2 Notify + FFF1 Write without FFF4)
+        Map<String, Integer> revFff0 = new LinkedHashMap<String, Integer>();
+        revFff0.put("fff1", Integer.valueOf(0x08));
+        revFff0.put("fff2", Integer.valueOf(0x10));
+        Elm327Protocol.GattBinding rff = Elm327Protocol.resolveAdapterBinding(revFff0);
+        check(rff != null && rff.profileName.contains("FFF0 Reversed"), "Reversed FFF0 must resolve when FFF4 absent");
+        check(Elm327Protocol.UUID_FFF2_WRITE.equals(rff.notifyUuid), "Reversed FFF0 notify must be FFF2");
+        check(Elm327Protocol.UUID_FFF1_NOTIFY.equals(rff.writeUuid), "Reversed FFF0 write must be FFF1");
+
+        // 1d. FFE0 Dual-Char (FFE1 Notify + FFE2 Write_NR) & FFE0/FFE5 (FFE4 Notify + FFE9 Write) & JieLi AE00
+        Map<String, Integer> ffeDual = new LinkedHashMap<String, Integer>();
+        ffeDual.put("ffe1", Integer.valueOf(0x10));
+        ffeDual.put("ffe2", Integer.valueOf(0x04));
+        Elm327Protocol.GattBinding fd = Elm327Protocol.resolveAdapterBinding(ffeDual);
+        check(fd != null && "FFE0 Dual-Char".equals(fd.profileName) && fd.writeWithoutResponse,
+                "FFE0 Dual-Char with WNR must resolve");
+
+        Map<String, Integer> ffe49 = new LinkedHashMap<String, Integer>();
+        ffe49.put("ffe4", Integer.valueOf(0x10));
+        ffe49.put("ffe9", Integer.valueOf(0x08));
+        check(Elm327Protocol.resolveAdapterBinding(ffe49) != null, "FFE0/FFE5 (FFE4+FFE9) must resolve");
+
+        Map<String, Integer> ae00 = new LinkedHashMap<String, Integer>();
+        ae00.put("ae02", Integer.valueOf(0x10));
+        ae00.put("ae01", Integer.valueOf(0x04));
+        check(Elm327Protocol.resolveAdapterBinding(ae00) != null, "JieLi AE00 (AE02+AE01) must resolve");
+
+        // 1e. Custom vendor UART fallback (e.g. 1002 Notify + 1001 Write) MUST resolve,
+        // while a partial GAP+GATT system-only table (2a00 READ|WRITE + 2a05 INDICATE) MUST return null!
+        Map<String, Integer> customUart = new LinkedHashMap<String, Integer>();
+        customUart.put("1002", Integer.valueOf(0x10));
+        customUart.put("1001", Integer.valueOf(0x08));
+        Elm327Protocol.GattBinding cu = Elm327Protocol.resolveAdapterBinding(customUart);
+        check(cu != null && cu.profileName.startsWith("Custom UART"), "Custom vendor UART must resolve");
+
+        Map<String, Integer> gapGattOnly = new LinkedHashMap<String, Integer>();
+        gapGattOnly.put("2a00", Integer.valueOf(0x0A)); // Device Name (Read|Write)
+        gapGattOnly.put("2a01", Integer.valueOf(0x02)); // Appearance (Read)
+        gapGattOnly.put("2a05", Integer.valueOf(0x20)); // Service Changed (Indicate)
+        check(Elm327Protocol.resolveAdapterBinding(gapGattOnly) == null,
+                "GAP+GATT system attributes (2a00/2a05) must NEVER falsely resolve as an ELM327 UART");
 
         // 2. LNEX BVM02 GATT table: FFF1=READ(0x02), FFF2=NOTIFY(0x10), FFF3=WRITE(0x08), FFF4=NOTIFY(0x10)
         // MUST BE REJECTED as an OBD adapter so we never send AT commands to a 12V battery sensor!
@@ -73,12 +128,16 @@ public final class ObdUnitTests {
         bvmProps.put(Bvm02Protocol.UUID_CMD_NOTIFY_STR, Integer.valueOf(0x10));
         check(Elm327Protocol.resolveAdapterBinding(bvmProps) == null,
                 "LNEX BVM02 GATT table must NEVER resolve as an ELM327 adapter");
+        check(Elm327Protocol.resolveAdapterBindings(bvmProps).isEmpty(),
+                "LNEX BVM02 GATT table must produce zero candidate bindings");
 
-        // 3. Name heuristics
+        // 3. Name & service advertisement heuristics
         check(Elm327Protocol.isLikelyObdAdapter("OBDCheck BLE", Collections.singletonList(Elm327Protocol.UUID_FFF0_SERVICE)),
                 "OBDCheck BLE must match OBD heuristic");
         check(Elm327Protocol.isLikelyObdAdapter("VEEPEAK", Collections.<String>emptyList()),
                 "VEEPEAK must match OBD heuristic");
+        check(Elm327Protocol.isLikelyObdAdapter("BLE Device", Collections.singletonList("18f0")),
+                "0x18F0 service advertisement must match OBD heuristic");
         check(!Elm327Protocol.isLikelyObdAdapter("BVM02", Collections.singletonList(Elm327Protocol.UUID_FFF0_SERVICE)),
                 "BVM02 must NOT match OBD heuristic even with FFF0");
 
@@ -91,6 +150,55 @@ public final class ObdUnitTests {
         check(!Elm327Protocol.isSafeInternalCommand("2EF190"), "UDS WriteDataByIdentifier 2E must be blocked");
         check(!Elm327Protocol.isSafeInternalCommand("2701"), "UDS SecurityAccess 27 must be blocked");
         check(!Elm327Protocol.isSafeInternalCommand("3101FF00"), "UDS RoutineControl 31 must be blocked");
+    }
+
+    private static void testTargetedServiceDiscoveryFallbackAndNotifyEvents() {
+        final List<String> sentLines = Collections.synchronizedList(new ArrayList<String>());
+        Gen5wBleClient.LineChannel mockChannel = new Gen5wBleClient.LineChannel() {
+            @Override
+            public void sendLine(String line) {
+                sentLines.add(line);
+            }
+
+            @Override
+            public void close() {}
+        };
+
+        String veepeakMac = "66:1E:87:00:B2:9F";
+        BleCoordinator coord = BleCoordinator.createForTest(mockChannel, veepeakMac, false, "");
+        sentLines.clear();
+
+        // Simulate legacy wildcard discovery that saw GATT_SVC 1800, 1801, 18f0,
+        // but aborted ATT 0x2803 after GAP (2a00:02,2a01:02) due to a handle gap!
+        Gen5wBleClient client = coord.getBleClient();
+        client.handleServerLine("@" + veepeakMac + " CONN_STATE CONNECTING " + veepeakMac);
+        client.handleServerLine("@" + veepeakMac + " GATT_SVC 1800 0001 0007");
+        client.handleServerLine("@" + veepeakMac + " GATT_SVC 1801 0010 0013");
+        client.handleServerLine("@" + veepeakMac + " GATT_SVC 18f0 0100 0106");
+        client.handleServerLine("@" + veepeakMac + " GATT_READY " + veepeakMac + " 2a00:02,2a01:02");
+
+        // Coordinator must NOT mark Incompatible GATT yet; it must disconnect and retry targeted service 18f0!
+        check(sentLines.contains("@" + veepeakMac + " DISCONNECT"),
+                "Coordinator must disconnect incomplete wildcard session to run targeted service retry, got: " + sentLines);
+        sentLines.clear();
+        client.handleServerLine("@" + veepeakMac + " CONN_STATE DISCONNECTED " + veepeakMac + " status=0 reason=USER_REQUESTED");
+        check(sentLines.contains("CONNECT " + veepeakMac + " -1 18f0"),
+                "Coordinator must immediately reconnect with targeted service filter '18f0', got: " + sentLines);
+
+        // Now deliver targeted GATT_READY for 18f0 (2af0:10,2af1:0c) + OP_OK ENABLE_NOTIFY
+        sentLines.clear();
+        client.handleServerLine("@" + veepeakMac + " CONN_STATE CONNECTING " + veepeakMac);
+        client.handleServerLine("@" + veepeakMac + " GATT_SVC 18f0 0100 0106");
+        client.handleServerLine("@" + veepeakMac + " GATT_CHAR 2af0 10 0102 0103");
+        client.handleServerLine("@" + veepeakMac + " GATT_CHAR 2af1 0c 0105 0106");
+        client.handleServerLine("@" + veepeakMac + " GATT_READY " + veepeakMac + " 2af0:10,2af1:0c");
+
+        check(coord.isObdConnected(), "Targeted 18f0 retry must bind and connect OBD session");
+        check(!sentLines.contains("@" + veepeakMac + " REQUEST_MTU 185"),
+                "Must NOT send unsolicited REQUEST_MTU 185 before ENABLE_NOTIFY");
+        check(sentLines.contains("@" + veepeakMac + " ENABLE_NOTIFY 2af0"),
+                "Must enable notifications on 2af0 after targeted GATT_READY, got: " + sentLines);
+        client.handleServerLine("@" + veepeakMac + " OP_OK ENABLE_NOTIFY 2af0");
     }
 
     private static void testChunkedBleIsoTpReassembly() {

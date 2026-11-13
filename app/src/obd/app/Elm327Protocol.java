@@ -2,10 +2,13 @@ package obd.app;
 
 import java.nio.charset.Charset;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Pure Java BLE ELM327 / STN / Veepeak OBDCheck BLE framing, GATT characteristic resolver,
@@ -24,19 +27,34 @@ public final class Elm327Protocol {
     public static final String UUID_FFF1_NOTIFY  = "0000fff1-0000-1000-8000-00805f9b34fb";
     public static final String UUID_FFF2_WRITE   = "0000fff2-0000-1000-8000-00805f9b34fb";
 
+    // Dual-mode BLE+SPP OBD profile (Service 0x18F0: 0x2AF0 Notify + 0x2AF1 Write)
+    public static final String UUID_18F0_SERVICE = "000018f0-0000-1000-8000-00805f9b34fb";
+    public static final String UUID_2AF0_NOTIFY  = "00002af0-0000-1000-8000-00805f9b34fb";
+    public static final String UUID_2AF1_WRITE   = "00002af1-0000-1000-8000-00805f9b34fb";
+
     // Secondary Microchip / ISSC Transparent UART BLE profile (used on alternate BLE OBD revisions)
-    public static final String UUID_ISSC_SERVICE = "49535343-fe7d-4ae5-8fa9-9fafd205e455";
-    public static final String UUID_ISSC_NOTIFY  = "49535343-1e4d-4bd9-ba61-23c647249616";
-    public static final String UUID_ISSC_WRITE   = "49535343-8841-43f4-a8d4-ecbe34729bb3";
+    public static final String UUID_ISSC_SERVICE  = "49535343-fe7d-4ae5-8fa9-9fafd205e455";
+    public static final String UUID_ISSC_NOTIFY   = "49535343-1e4d-4bd9-ba61-23c647249616";
+    public static final String UUID_ISSC_WRITE    = "49535343-8841-43f4-a8d4-ecbe34729bb3";
+    public static final String UUID_ISSC_AIRPATCH = "49535343-aca3-481c-91ec-d85e28a60318";
 
     // Tertiary Nordic UART Service (NUS) fallback
     public static final String UUID_NUS_SERVICE  = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     public static final String UUID_NUS_WRITE    = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     public static final String UUID_NUS_NOTIFY   = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
-    // Alternate FFE0 HM-10 style BLE ELM adapters (single R/W/Notify char 0xFFE1)
+    // Alternate FFE0 / FFE5 BLE ELM adapters (single-char FFE1, dual-char FFE1+FFE2, or FFE4+FFE9)
     public static final String UUID_FFE0_SERVICE = "0000ffe0-0000-1000-8000-00805f9b34fb";
     public static final String UUID_FFE1_RW_NOT  = "0000ffe1-0000-1000-8000-00805f9b34fb";
+    public static final String UUID_FFE2_WRITE   = "0000ffe2-0000-1000-8000-00805f9b34fb";
+    public static final String UUID_FFE4_NOTIFY  = "0000ffe4-0000-1000-8000-00805f9b34fb";
+    public static final String UUID_FFE9_WRITE   = "0000ffe9-0000-1000-8000-00805f9b34fb";
+
+    // Dual-mode Vlink / JieLi BLE UART profiles
+    public static final String UUID_VLINK_SERVICE = "e7810a71-73ae-499d-8c15-faa9aef0c3f2";
+    public static final String UUID_VLINK_RW_NOT  = "bef8d6c9-9c21-4c9e-b632-bd58c1009f9f";
+    public static final String UUID_AE01_WRITE    = "0000ae01-0000-1000-8000-00805f9b34fb";
+    public static final String UUID_AE02_NOTIFY   = "0000ae02-0000-1000-8000-00805f9b34fb";
 
     // BVM02 command notify UUID used to ensure we NEVER treat a BVM02 sensor as an OBD adapter
     private static final String UUID_BVM02_CMD_NOTIFY = "0000fff4-0000-1000-8000-00805f9b34fb";
@@ -75,7 +93,8 @@ public final class Elm327Protocol {
         "elm327",
         "carista",
         "konnwei",
-        "nexas"
+        "nexas",
+        "viecar"
     };
 
     private Elm327Protocol() {}
@@ -88,12 +107,28 @@ public final class Elm327Protocol {
         public final String notifyUuid;
         public final String writeUuid;
         public final boolean writeWithoutResponse;
+        public final int writeProps;
 
         public GattBinding(String profileName, String notifyUuid, String writeUuid, boolean writeWithoutResponse) {
+            this(profileName, notifyUuid, writeUuid, writeWithoutResponse,
+                    writeWithoutResponse ? PROP_WRITE_NO_RESP : PROP_WRITE);
+        }
+
+        public GattBinding(String profileName, String notifyUuid, String writeUuid,
+                           boolean writeWithoutResponse, int writeProps) {
             this.profileName = profileName;
             this.notifyUuid = notifyUuid;
             this.writeUuid = writeUuid;
             this.writeWithoutResponse = writeWithoutResponse;
+            this.writeProps = writeProps;
+        }
+
+        public boolean supportsAlternateWriteMode() {
+            return (writeProps & (PROP_WRITE | PROP_WRITE_NO_RESP)) == (PROP_WRITE | PROP_WRITE_NO_RESP);
+        }
+
+        public GattBinding withWriteWithoutResponse(boolean wnr) {
+            return new GattBinding(profileName, notifyUuid, writeUuid, wnr, writeProps);
         }
     }
 
@@ -161,6 +196,14 @@ public final class Elm327Protocol {
         return s;
     }
 
+    public static String expandFullUuid(String normOrFull) {
+        String n = normUuid(normOrFull);
+        if (n.length() == 4) {
+            return "0000" + n + "-0000-1000-8000-00805f9b34fb";
+        }
+        return n;
+    }
+
     /**
      * Heuristic advertisement matcher for Veepeak OBDCheck BLE and compatible BLE OBD-II scanners.
      * Explicitly excludes LNEX BVM02 battery sensors.
@@ -182,7 +225,15 @@ public final class Elm327Protocol {
                 String u = serviceUuids.get(i);
                 if (u == null) continue;
                 String norm = normUuid(u);
-                if (UUID_ISSC_SERVICE.equals(norm) || UUID_NUS_SERVICE.equals(norm) || "ffe0".equals(norm)) {
+                if (UUID_ISSC_SERVICE.equals(norm)
+                        || UUID_NUS_SERVICE.equals(norm)
+                        || UUID_VLINK_SERVICE.equals(norm)
+                        || "18f0".equals(norm)
+                        || "ffe0".equals(norm)
+                        || "ffe5".equals(norm)
+                        || "ae00".equals(norm)
+                        || "ae30".equals(norm)
+                        || "e010".equals(norm)) {
                     return true;
                 }
                 if ("fff0".equals(norm) && !Bvm02Protocol.isLikelyBvm02Device(localName, null)) {
@@ -194,12 +245,21 @@ public final class Elm327Protocol {
     }
 
     /**
-     * Resolves the notify/write characteristic binding from {@code GATT_READY} properties,
+     * Resolves the highest-priority notify/write characteristic binding from {@code GATT_READY} properties,
      * with strict hardware safety checks so an LNEX BVM02 sensor is NEVER mistaken for an OBD adapter.
      */
     public static GattBinding resolveAdapterBinding(Map<String, Integer> charPropsByUuid) {
+        List<GattBinding> all = resolveAdapterBindings(charPropsByUuid);
+        return all.isEmpty() ? null : all.get(0);
+    }
+
+    /**
+     * Resolves an ordered list of candidate ELM327 BLE GATT bindings so dual-service or reversed-polarity
+     * adapters can be verified live via {@code ATI}/{@code ATZ} handshake probing.
+     */
+    public static List<GattBinding> resolveAdapterBindings(Map<String, Integer> charPropsByUuid) {
         if (charPropsByUuid == null || charPropsByUuid.isEmpty()) {
-            return null;
+            return Collections.emptyList();
         }
         Map<String, Integer> normProps = new LinkedHashMap<String, Integer>();
         for (Map.Entry<String, Integer> e : charPropsByUuid.entrySet()) {
@@ -208,59 +268,138 @@ public final class Elm327Protocol {
             }
         }
 
-        // Hardware safety check: BVM02 exposes 0xFFF4 (NOTIFY) and has 0xFFF1 as READ-only (no NOTIFY).
+        // Hardware safety check: LNEX BVM02 exposes 0xFFF4 (NOTIFY) and has 0xFFF1 as READ-only (0x02).
+        // Never allow a BVM02 12V battery sensor to resolve as an OBD-II adapter.
         Integer pFff1 = normProps.get("fff1");
-        Integer pFff2 = normProps.get("fff2");
         Integer pFff4 = normProps.get("fff4");
-        if (pFff4 != null && (pFff1 == null || (pFff1.intValue() & (PROP_NOTIFY | PROP_INDICATE)) == 0)) {
-            return null;
-        }
-
-        // 1. Primary Veepeak OBDCheck BLE profile: FFF1 Notify + FFF2 Write/WriteNoResp
-        if (pFff1 != null && pFff2 != null) {
-            int f1 = pFff1.intValue();
-            int f2 = pFff2.intValue();
-            if ((f1 & (PROP_NOTIFY | PROP_INDICATE)) != 0 && (f2 & (PROP_WRITE | PROP_WRITE_NO_RESP)) != 0) {
-                boolean wnr = (f2 & PROP_WRITE) == 0 && (f2 & PROP_WRITE_NO_RESP) != 0;
-                return new GattBinding("FFF0 (Veepeak BLE)", UUID_FFF1_NOTIFY, UUID_FFF2_WRITE, wnr);
+        boolean hasBvmCmdNotify = pFff4 != null && (pFff4.intValue() & (PROP_NOTIFY | PROP_INDICATE)) != 0;
+        if (hasBvmCmdNotify) {
+            boolean fff1Active = pFff1 != null
+                    && (pFff1.intValue() & (PROP_NOTIFY | PROP_INDICATE | PROP_WRITE | PROP_WRITE_NO_RESP)) != 0;
+            if (!fff1Active) {
+                return Collections.emptyList();
             }
         }
 
-        // 2. Microchip / ISSC Transparent UART profile
-        Integer pIsscN = normProps.get(UUID_ISSC_NOTIFY);
-        Integer pIsscW = normProps.get(UUID_ISSC_WRITE);
-        if (pIsscN != null && pIsscW != null) {
-            int fn = pIsscN.intValue();
-            int fw = pIsscW.intValue();
-            if ((fn & (PROP_NOTIFY | PROP_INDICATE)) != 0 && (fw & (PROP_WRITE | PROP_WRITE_NO_RESP)) != 0) {
-                boolean wnr = (fw & PROP_WRITE) == 0 && (fw & PROP_WRITE_NO_RESP) != 0;
-                return new GattBinding("ISSC UART", UUID_ISSC_NOTIFY, UUID_ISSC_WRITE, wnr);
+        List<GattBinding> out = new ArrayList<GattBinding>();
+        Set<String> seenPairs = new HashSet<String>();
+
+        // 1. Standard Veepeak OBDCheck BLE / Vgate FFF0: FFF1 Notify + FFF2 Write
+        addCandidateIfValid(out, seenPairs, normProps, "FFF0 (Veepeak BLE)", "fff1", "fff2");
+
+        // 2. Dual-Mode SPP+BLE 18F0: 2AF0 Notify + 2AF1 Write (and reversed 2AF1/2AF0)
+        addCandidateIfValid(out, seenPairs, normProps, "18F0 (Dual-Mode BLE)", "2af0", "2af1");
+        addCandidateIfValid(out, seenPairs, normProps, "18F0 Reversed", "2af1", "2af0");
+
+        // 3. Reversed FFF0: FFF2 Notify + FFF1 Write (strictly when BVM02 FFF4 is absent!)
+        if (!hasBvmCmdNotify) {
+            addCandidateIfValid(out, seenPairs, normProps, "FFF0 Reversed (FFF2/FFF1)", "fff2", "fff1");
+        }
+
+        // 4. Microchip / ISSC Transparent UART (and reversed / AirPatch variants)
+        addCandidateIfValid(out, seenPairs, normProps, "ISSC UART", UUID_ISSC_NOTIFY, UUID_ISSC_WRITE);
+        addCandidateIfValid(out, seenPairs, normProps, "ISSC Reversed", UUID_ISSC_WRITE, UUID_ISSC_NOTIFY);
+        addCandidateIfValid(out, seenPairs, normProps, "ISSC AirPatch", UUID_ISSC_AIRPATCH, UUID_ISSC_AIRPATCH);
+
+        // 5. Nordic UART Service (NUS)
+        addCandidateIfValid(out, seenPairs, normProps, "Nordic NUS", UUID_NUS_NOTIFY, UUID_NUS_WRITE);
+
+        // 6. Dual-Service FFE0 + FFE5 (FFE4 Notify + FFE9 Write) & Dual-Char FFE1/FFE2
+        addCandidateIfValid(out, seenPairs, normProps, "FFE0/FFE5 UART", "ffe4", "ffe9");
+        addCandidateIfValid(out, seenPairs, normProps, "FFE0 Dual-Char", "ffe1", "ffe2");
+        addCandidateIfValid(out, seenPairs, normProps, "FFE0 Reversed", "ffe2", "ffe1");
+
+        // 7. Single-characteristic UART profiles (FFE1, Vlink BEF8..., FFF1/FFF2)
+        addCandidateIfValid(out, seenPairs, normProps, "FFE0 Single-Char", "ffe1", "ffe1");
+        addCandidateIfValid(out, seenPairs, normProps, "Vlink BLE UART", UUID_VLINK_RW_NOT, UUID_VLINK_RW_NOT);
+        if (!hasBvmCmdNotify) {
+            addCandidateIfValid(out, seenPairs, normProps, "FFF0 Single-Char (FFF1)", "fff1", "fff1");
+            addCandidateIfValid(out, seenPairs, normProps, "FFF0 Single-Char (FFF2)", "fff2", "fff2");
+        }
+        addCandidateIfValid(out, seenPairs, normProps, "18F0 Single-Char (2AF0)", "2af0", "2af0");
+
+        // 8. JieLi AE00 BLE SPP-over-GATT (AE02 Notify + AE01 Write)
+        addCandidateIfValid(out, seenPairs, normProps, "AE00 BLE UART", "ae02", "ae01");
+        addCandidateIfValid(out, seenPairs, normProps, "AE00 Reversed", "ae01", "ae02");
+
+        // 9. Generic Custom Vendor UART Fallback (strictly excluding standard Bluetooth SIG 0x2Axx/0x2Bxx chars)
+        if (!hasBvmCmdNotify) {
+            List<String> customNotify = new ArrayList<String>();
+            List<String> customWrite = new ArrayList<String>();
+            for (Map.Entry<String, Integer> e : normProps.entrySet()) {
+                String u = e.getKey();
+                int p = e.getValue().intValue();
+                if (isStandardBluetoothSigCharacteristic(u)) {
+                    continue;
+                }
+                if ((p & (PROP_NOTIFY | PROP_INDICATE)) != 0) {
+                    customNotify.add(u);
+                }
+                if ((p & (PROP_WRITE | PROP_WRITE_NO_RESP)) != 0) {
+                    customWrite.add(u);
+                }
+            }
+            for (int i = 0; i < customNotify.size(); i++) {
+                String nu = customNotify.get(i);
+                for (int j = 0; j < customWrite.size(); j++) {
+                    String wu = customWrite.get(j);
+                    if (!nu.equals(wu)) {
+                        addCandidateIfValid(out, seenPairs, normProps,
+                                "Custom UART (" + shortTag(nu) + "/" + shortTag(wu) + ")", nu, wu);
+                    }
+                }
+            }
+            for (int i = 0; i < customNotify.size(); i++) {
+                String rw = customNotify.get(i);
+                if (customWrite.contains(rw)) {
+                    addCandidateIfValid(out, seenPairs, normProps,
+                            "Custom Single-Char (" + shortTag(rw) + ")", rw, rw);
+                }
             }
         }
 
-        // 3. Nordic UART Service (NUS)
-        Integer pNusN = normProps.get(UUID_NUS_NOTIFY);
-        Integer pNusW = normProps.get(UUID_NUS_WRITE);
-        if (pNusN != null && pNusW != null) {
-            int fn = pNusN.intValue();
-            int fw = pNusW.intValue();
-            if ((fn & (PROP_NOTIFY | PROP_INDICATE)) != 0 && (fw & (PROP_WRITE | PROP_WRITE_NO_RESP)) != 0) {
-                boolean wnr = (fw & PROP_WRITE) == 0 && (fw & PROP_WRITE_NO_RESP) != 0;
-                return new GattBinding("Nordic NUS", UUID_NUS_NOTIFY, UUID_NUS_WRITE, wnr);
-            }
-        }
+        return Collections.unmodifiableList(out);
+    }
 
-        // 4. HM-10 / FFE1 single-characteristic BLE ELM327 clone
-        Integer pFfe1 = normProps.get("ffe1");
-        if (pFfe1 != null) {
-            int f = pFfe1.intValue();
-            if ((f & (PROP_NOTIFY | PROP_INDICATE)) != 0 && (f & (PROP_WRITE | PROP_WRITE_NO_RESP)) != 0) {
-                boolean wnr = (f & PROP_WRITE) == 0 && (f & PROP_WRITE_NO_RESP) != 0;
-                return new GattBinding("FFE0 Single-Char", UUID_FFE1_RW_NOT, UUID_FFE1_RW_NOT, wnr);
-            }
-        }
+    private static void addCandidateIfValid(List<GattBinding> out,
+                                            Set<String> seenPairs,
+                                            Map<String, Integer> normProps,
+                                            String profileName,
+                                            String notifyNorm,
+                                            String writeNorm) {
+        Integer pnObj = normProps.get(notifyNorm);
+        Integer pwObj = normProps.get(writeNorm);
+        if (pnObj == null || pwObj == null) return;
+        int pn = pnObj.intValue();
+        int pw = pwObj.intValue();
+        if ((pn & (PROP_NOTIFY | PROP_INDICATE)) == 0) return;
+        if ((pw & (PROP_WRITE | PROP_WRITE_NO_RESP)) == 0) return;
+        String key = notifyNorm + "->" + writeNorm;
+        if (!seenPairs.add(key)) return;
+        boolean wnr = (pw & PROP_WRITE) == 0 && (pw & PROP_WRITE_NO_RESP) != 0;
+        out.add(new GattBinding(profileName, expandFullUuid(notifyNorm), expandFullUuid(writeNorm), wnr, pw));
+    }
 
-        return null;
+    /**
+     * Returns {@code true} for standard Bluetooth SIG characteristic UUIDs ({@code 0x2A00..0x2BFF},
+     * such as {@code 2a00} Device Name or {@code 2a05} Service Changed) so generic custom-UART
+     * fallback never binds to GAP/GATT/DeviceInfo/Battery system attributes.
+     */
+    public static boolean isStandardBluetoothSigCharacteristic(String normUuid) {
+        if (normUuid == null || normUuid.length() != 4) {
+            return false;
+        }
+        try {
+            int val = Integer.parseInt(normUuid, 16);
+            return val >= 0x2A00 && val <= 0x2BFF;
+        } catch (NumberFormatException nfe) {
+            return false;
+        }
+    }
+
+    private static String shortTag(String normUuid) {
+        if (normUuid == null) return "?";
+        return normUuid.length() > 8 ? normUuid.substring(0, 8) : normUuid;
     }
 
     /**

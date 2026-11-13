@@ -40,9 +40,12 @@ public final class Gen5wBleClient {
         void onScanStateChanged(boolean scanning, String error);
         void onAdvertisement(String mac, int addrType, int rssi, Gen5wBleAdvRecord record);
         void onConnecting(String mac);
+        void onGattServiceDiscovered(String mac, String serviceUuid, int startHandle, int endHandle);
+        void onGattCharacteristicDiscovered(String mac, String charUuid, int props, int valHandle, int endHandle);
         void onConnected(String mac, Map<String, Integer> charPropsByUuid);
         void onDisconnected(String mac, int status, String reason);
         void onMtuChanged(String mac, int mtu, String error);
+        void onNotificationStateChanged(String mac, String uuid, boolean enabled, String error);
         void onCharacteristicRead(String mac, String uuid, byte[] value, String error);
         void onCharacteristicChanged(String mac, String uuid, byte[] value);
         void onCharacteristicWrite(String mac, String uuid, String error);
@@ -54,9 +57,12 @@ public final class Gen5wBleClient {
         @Override public void onScanStateChanged(boolean scanning, String error) {}
         @Override public void onAdvertisement(String mac, int addrType, int rssi, Gen5wBleAdvRecord record) {}
         @Override public void onConnecting(String mac) {}
+        @Override public void onGattServiceDiscovered(String mac, String serviceUuid, int startHandle, int endHandle) {}
+        @Override public void onGattCharacteristicDiscovered(String mac, String charUuid, int props, int valHandle, int endHandle) {}
         @Override public void onConnected(String mac, Map<String, Integer> charPropsByUuid) {}
         @Override public void onDisconnected(String mac, int status, String reason) {}
         @Override public void onMtuChanged(String mac, int mtu, String error) {}
+        @Override public void onNotificationStateChanged(String mac, String uuid, boolean enabled, String error) {}
         @Override public void onCharacteristicRead(String mac, String uuid, byte[] value, String error) {}
         @Override public void onCharacteristicChanged(String mac, String uuid, byte[] value) {}
         @Override public void onCharacteristicWrite(String mac, String uuid, String error) {}
@@ -247,9 +253,31 @@ public final class Gen5wBleClient {
             }
             return;
         }
+        if ("GATT_SVC".equals(head) && p.length >= 4) {
+            if (listener != null) {
+                listener.onGattServiceDiscovered(
+                        mac,
+                        Gen5wBleAdvRecord.normalizeUuid(p[1]),
+                        parseHexSafe(p[2], 0),
+                        parseHexSafe(p[3], 0));
+            }
+            return;
+        }
+        if ("GATT_CHAR".equals(head) && p.length >= 5) {
+            if (listener != null) {
+                listener.onGattCharacteristicDiscovered(
+                        mac,
+                        Gen5wBleAdvRecord.normalizeUuid(p[1]),
+                        parseHexSafe(p[2], 0),
+                        parseHexSafe(p[3], 0),
+                        parseHexSafe(p[4], 0));
+            }
+            return;
+        }
         if ("GATT_READY".equals(head) && p.length >= 3) {
             Map<String, Integer> specs = parseGattReadySpecs(p[2]);
-            if (listener != null) listener.onConnected(p[1], specs);
+            String readyMac = p[1].toUpperCase(Locale.US);
+            if (listener != null) listener.onConnected(readyMac, specs);
             return;
         }
         if ("CHAR_NOTIFY".equals(head) && p.length >= 3) {
@@ -263,6 +291,10 @@ public final class Gen5wBleClient {
             String op = p[1];
             if ("REQUEST_MTU".equals(op) && p.length >= 3) {
                 if (listener != null) listener.onMtuChanged(mac, parseIntSafe(p[2], 23), null);
+            } else if ("ENABLE_NOTIFY".equals(op) && p.length >= 3) {
+                if (listener != null) listener.onNotificationStateChanged(mac, p[2], true, null);
+            } else if ("DISABLE_NOTIFY".equals(op) && p.length >= 3) {
+                if (listener != null) listener.onNotificationStateChanged(mac, p[2], false, null);
             } else if (("READ_CHAR".equals(op) || "READ_LONG_CHAR".equals(op)) && p.length >= 4) {
                 if (listener != null) listener.onCharacteristicRead(mac, p[2], hexToBytes(p[3]), null);
             } else if ("READ_BLOB".equals(op) && p.length >= 5) {
@@ -276,6 +308,8 @@ public final class Gen5wBleClient {
             String op = p[1];
             if ("REQUEST_MTU".equals(op)) {
                 if (listener != null) listener.onMtuChanged(mac, 23, p[2]);
+            } else if (("ENABLE_NOTIFY".equals(op) || "DISABLE_NOTIFY".equals(op)) && p.length >= 4) {
+                if (listener != null) listener.onNotificationStateChanged(mac, p[2], false, p[3]);
             } else if (("READ_CHAR".equals(op) || "READ_LONG_CHAR".equals(op) || "READ_BLOB".equals(op))
                     && p.length >= 4) {
                 if (listener != null) listener.onCharacteristicRead(mac, p[2], null, p[3]);
@@ -444,6 +478,14 @@ public final class Gen5wBleClient {
     private static int parseIntSafe(String s, int fallback) {
         try {
             return Integer.parseInt(s.trim());
+        } catch (Throwable t) {
+            return fallback;
+        }
+    }
+
+    private static int parseHexSafe(String s, int fallback) {
+        try {
+            return Integer.parseInt(s.trim(), 16);
         } catch (Throwable t) {
             return fallback;
         }
